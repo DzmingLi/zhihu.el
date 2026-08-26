@@ -1,6 +1,6 @@
 # Zhihu On Emacs
 
-在 Emacs 中使用 Markdown/Typst/Org 作为源文件来撰写、存档并发布知乎
+在 Emacs 中使用 Markdown 或 Typst 作为源文件来撰写、存档并发布知乎
 回答、文章和想法，并可以指定文章专栏。
 
 > [!WARNING]
@@ -16,7 +16,7 @@
 - 可选：使用 Typst 源文件，或转换本地路径 / `data:` URL 中的 SVG 时，
   需要 PATH 中的 [`typst`](https://typst.app/) 0.15.0 或更高版本；编辑
   Typst 源文件可另装 `typst-ts-mode` 或 `typst-mode`
-- 可选：如果 Markdown 或 Org 使用 Mermaid 图，
+- 可选：如果 Markdown 使用 Mermaid 图，
   [`@mermaid-js/mermaid-cli`](https://github.com/mermaid-js/mermaid-cli)
   提供的 `mmdc`
 
@@ -39,7 +39,9 @@ profile 根目录都需要显式设置给`zhihu-cookie-profile-directory`。本�
 想法没有单独指定评论权限时，使用
 `zhihu-publish-default-comment-permission`（默认 `all`）。
 
-Markdown 正文标题默认整体下移一级，为知乎页面标题保留 `h1`。如需保留Markdown 源稿的自然标题层级，可将`zhihu-enable-markdown-heading-level-shift` 设为 `nil`, Org 和 Typst 不读取该选项。
+Markdown 正文标题默认整体下移一级，为知乎页面标题保留 `h1`。如需保留
+Markdown 源稿的自然标题层级，可将
+`zhihu-enable-markdown-heading-level-shift` 设为 `nil`；Typst 不读取该选项。
 
 如需在文章末尾自动追加 Creative Commons 许可引用，可通过`zhihu-article-cc-statement` 自定义，这一选项将会适用于所有文章。
 
@@ -62,8 +64,8 @@ M-x zhihu-new-column
 专栏名称必填且最多 20 个字符，简介可空且最多 1000 个字符。封面是可选的，
 本命令不会提示或上传封面。
 
-写新文章或想法无需专用的新建命令：创建 `.typ`、`.md`、`.markdown` 或
-`.org` 源稿即可。保留空 `thought-id` 时作为新想法，保留空 `article-id` 时作为
+写新文章或想法无需专用的新建命令：创建 `.typ`、`.md` 或 `.markdown`
+源稿即可。保留空 `thought-id` 时作为新想法，保留空 `article-id` 时作为
 新文章；文章需要文档标题，想法标题可选。需要指定专栏、话题或其它发布设置时，
 再添加相应 metadata。
 
@@ -77,7 +79,7 @@ M-x zhihu-publish
 其中空 `article-id` 或 `thought-id` 表示首次发布，非空值表示更新已有内容。
 
 `zhihu-mode` 是不占用键位的编辑辅助 minor mode。本包不会扫描或自动识别
-Markdown、Org 和 Typst 文件；需要编辑辅助时手动运行 `M-x zhihu-mode`。
+Markdown 和 Typst 文件；需要编辑辅助时手动运行 `M-x zhihu-mode`。
 在 Markdown `zhihu:` mapping 或 Typst `<zhihu>`
 dictionary 尚未写入冒号的直接字段名位置运行 `M-x completion-at-point`，
 会按当前稿件类型和已有字段补全 `question-id:`、`article-id:`、
@@ -88,8 +90,8 @@ dictionary 尚未写入冒号的直接字段名位置运行 `M-x completion-at-p
 
 ## 语法
 
-在文章和回答中，数学公式、表格、加粗、斜体、标题层级、超链接、代码块、
-task list（以字符形式降级）和脚注均受支持。采用各个源稿格式自带的语法。
+在文章和回答中，数学公式、表格、加粗、斜体、标题层级、超链接、代码块和
+脚注均受支持。采用各个源稿格式自带的语法。
 
 ### Typst HTML 导出的上游限制
 
@@ -130,17 +132,6 @@ Markdown 用 heading attribute 声明稳定 ID：
 ## 结论 {#conclusion}
 ```
 
-Org 用 `CUSTOM_ID`：
-
-```org
-[[#conclusion][跳到结论]]
-
-** 结论
-:PROPERTIES:
-:CUSTOM_ID: conclusion
-:END:
-```
-
 Typst 用 label：
 
 ```typst
@@ -155,45 +146,20 @@ Typst 用 label：
 
 ### 链接卡片
 
-卡片直接写在正文中，必须独占一个段落，显示标题不能为空。链接卡片目前只用于回答和文章；想法发布会明确拒绝它。
+卡片直接使用 Microformats2 的 [`h-cite`](https://microformats.org/wiki/h-cite)
+HTML，必须独占一个段落。一个卡片必须恰好包含一个 `u-url` 和一个非空
+`p-name`；`u-url` 必须是带 host 的 HTTP(S) 链接：
 
-Markdown 使用链接 title `card`：
-
-```markdown
-[GitHub](https://github.com/ "card")
+```html
+<div class="h-cite">
+  <a class="u-url p-name" href="https://github.com/">GitHub</a>
+</div>
 ```
 
-Org 使用后端属性修饰紧随其后的普通链接：
-
-```org
-#+ATTR_ZHIHU: :type link-card
-[[https://github.com/][GitHub]]
-```
-
-Typst 先在文档或模板中定义 `card-link`。知乎发布使用 HTML 标记，其它
-Typst 输出目标则退化为普通链接：
-
-```typst
-#let card-link(url, body) = context {
-  if target() == "html" {
-    html.elem(
-      "a",
-      attrs: (
-        href: url,
-        "data-zhihu-card": "",
-      ),
-      body,
-    )
-  } else {
-    link(url, body)
-  }
-}
-
-#card-link("https://github.com/")[GitHub]
-```
-
-`target()` 是上下文函数，因此 helper 外层的 `context` 不能省略；旧模板不再
-使用 `sys.inputs` 读取发布目标。
+Markdown 可以直接嵌入这段 HTML。Typst 可用 `html.elem` 输出同样的结构；博客
+也可直接用 `.h-cite`、`.u-url` 和 `.p-name` 编写 CSS。`p-author`、
+`p-publication`、`dt-published` 等标准 h-cite 属性可以留给博客使用，发布知乎时
+只读取 URL 和标题。链接卡片目前只用于回答和文章；想法发布会明确拒绝它。
 
 ### @ 知乎用户
 
@@ -217,15 +183,11 @@ M-x completion-at-point
 ```
 
 补全会按当前元素的文字调用知乎话题搜索，保留远端相关性顺序，并在候选中
-显示简介和话题 ID；提交后源稿只保留规范的话题名称。三种源格式的写法分别是：
+显示简介和话题 ID；提交后源稿只保留规范的话题名称。两种源格式的写法分别是：
 
 ```yaml
 topics:
   - "Emacs"
-```
-
-```org
-#+ZHIHU_TOPICS: ["Emacs", "org-mode"]
 ```
 
 ```typst
@@ -272,8 +234,7 @@ topics: (
 知乎引用只能保存一段纯文本和一个可选 URL。因此脚注目前必须是单段，最多
 包含一个带 host 的 HTTP(S) 链接；强调、粗体、删除线和行内代码会转成纯文本。
 多段、多链接、列表、代码块、图片、公式或 raw 内容会在发布前报错，避免静默
-丢失信息；嵌套脚注不在支持范围内。纯文字脚注会生成空的引用 URL。Org Cite
-不会自动冒充脚注。
+丢失信息；嵌套脚注不在支持范围内。纯文字脚注会生成空的引用 URL。
 
 
 ## 分割线
@@ -358,7 +319,7 @@ zhihu:
 ---
 ```
 
-Typst 对应写作 `topics: ("Emacs", "org-mode",)`；单元素 array 也保留尾逗号。
+Typst 对应写作 `topics: ("Emacs", "org-mode",)`；单元素 tuple 也保留尾逗号。
 
 每篇源稿必须且只能包含 `question-id`、`article-id` 或 `thought-id` 之一，分别
 表示回答、文章或想法。类型按字段是否存在判定，而不是按 ID 是否非空判定；
@@ -368,31 +329,24 @@ Markdown 的 `zhihu:` 必须单独占一行，字段写在后续缩进行；不�
 `zhihu: {...}` 单行形式。顶层 `zhihu` 和其中每个已知字段都只能出现一次。
 
 `article-id` 和 `thought-id` 是仅有的空值例外：首次发布前保留空槽，发布成功后
-自动在原位写入服务端 ID。Markdown 写作空值，Org 保留空关键字，Typst 写作
-`none`。尚未取得的 `answer-id` 仍应整个省略。
+自动在原位写入服务端 ID。Markdown 写作空值，Typst 写作 `none`。尚未取得的
+`answer-id` 仍应整个省略。
 
 需要加入专栏时，在含 `article-id` 的文章 metadata 下额外填写 `column-id`；
 `column-id` 不能单独标记文章。发布文章后会检查当前专栏，尚未收录时才发起
-收录。Typst 也使用相同字段。启用 `zhihu-mode` 后，可在三种格式的该字段
+收录。Typst 也使用相同字段。启用 `zhihu-mode` 后，可在两种格式的该字段
 值槽调用 `completion-at-point`，按专栏名称选择并写入 ID；候选列表在当前
 buffer 中懒加载并缓存，revert 后重新读取。
 
 `banner` 与 `title` 一样属于通用文档 metadata：Markdown 使用 YAML 顶层
-`banner`，Org 使用 `#+BANNER`，Typst 使用
-`#metadata("...") <banner>`；它不写进 `zhihu` mapping 或任何
-`#+ZHIHU_*` 关键字。值是非空的本地图片路径，相对路径以源稿所在目录为基。
+`banner`，Typst 使用 `#metadata("...") <banner>`；它不写进 `zhihu`
+mapping。值是非空的本地图片路径，相对路径以源稿所在目录为基。
 知乎文章发布会把它用作题图，字段缺失会清除知乎上的现有封面；回答和想法发布
 不会读取或使用它。
 
 目录请求也属于通用文档结构，不属于知乎渠道字段。Markdown 在 YAML front
 matter 顶层写 `toc: true`；Typst 使用原生 `#outline()`，也可用
-`#outline(depth: 2)` 限制深度；Org 使用原生目录指令：
-
-```org
-#+TOC: headlines 2
-```
-
-Org 允许省略深度写成 `#+TOC: headlines`，或指定 1–3 的目录深度。只有文章
+`#outline(depth: 2)` 限制深度。只有文章
 发布会读取目录请求，并把它映射为知乎原生文章目录；回答和想法会忽略它。
 Typst 中，zhihu.el 只把以 `heading`（包括 `heading.where(...)`）为 target
 的 outline 当作这个开关，并在编译 HTML 前通过临时 Typst wrapper 的 show
@@ -401,8 +355,7 @@ rule 隐藏该 heading outline，避免与知乎原生目录重复；原稿不�
 在发布正文中。没有目录请求，或 Markdown 将 `toc` 设为 `false` 时，文章目录
 关闭。
 
-以下知乎设置都属于单篇稿件。Typst 和 Markdown 使用表中的 metadata 字段；
-Org 使用对应的 `#+ZHIHU_*` 关键字。
+以下知乎设置都属于单篇稿件。Typst 和 Markdown 使用表中的 metadata 字段。
 
 | 设置 | Typst / Markdown 字段 | 可用值 | 未填写时 |
 | --- | --- | --- | --- |
@@ -417,27 +370,6 @@ Org 使用对应的 `#+ZHIHU_*` 关键字。
 
 上表中的可选发布设置缺失时使用对应默认值；一旦出现，就必须是非空且类型、
 取值有效的值。
-
-**Org:**
-
-
-- `#+ZHIHU_QUESTION_ID`：问题 ID。
-- `#+ZHIHU_ANSWER_ID`：回答 ID；首次取得服务端 ID 后才会出现。
-- `#+ZHIHU_ARTICLE_ID`：文章 ID；新文章可保留空关键字，发布后自动写回。
-- `#+ZHIHU_COLUMN_ID`：文章要加入的专栏 ID；发布后会检查并收录。
-- `#+ZHIHU_THOUGHT_ID`：想法 ID；新想法保留空关键字，发布后自动写回。
-- `#+BANNER`：通用文档题图；不是 `#+ZHIHU_*` 状态。
-- `#+ZHIHU_TOPICS`：文章或想法话题名称组成的单行 JSON array，例如
-  `["Emacs","org-mode"]`。
-- `#+ZHIHU_CREATION_STATEMENT`：本篇创作声明。
-- `#+ZHIHU_CONTENT_SOURCE`：本篇内容的信息来源渠道。
-- `#+ZHIHU_REPRINT_PERMISSION`：本篇转载权限；未写时使用默认值。
-- `#+ZHIHU_COMMENT_PERMISSION`：本篇评论权限；未写时使用默认值。
-
-`#+BANNER` 和每个已知的 `#+ZHIHU_*` 关键字最多出现一次。只有
-`#+ZHIHU_ARTICLE_ID` / `#+ZHIHU_THOUGHT_ID` 允许为空；其它字段未设置时应删除
-整行。`#+ZHIHU_QUESTION_ID`、`#+ZHIHU_ARTICLE_ID` 与 `#+ZHIHU_THOUGHT_ID`
-必须且只能出现一个。
 
 ## Roadmap
 

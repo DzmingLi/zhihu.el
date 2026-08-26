@@ -69,9 +69,15 @@
       (should (equal (dom-attr anchor 'data-draft-type) "link-card"))
       (should (equal (dom-attr anchor 'data-draft-title) expected-title))
       (should (equal (dom-attr anchor 'data-draft-cover) ""))
-      (should-not (dom-attr anchor 'data-zhihu-card))
       (should-not (dom-attr anchor 'title))
       anchor)))
+
+(defun zhihu-test--h-cite-html (&optional url title)
+  "Return a minimal Microformats2 h-cite card for URL and TITLE."
+  (format
+   "<div class=\"h-cite\"><a class=\"u-url p-name\" href=\"%s\">%s</a></div>"
+   (or url "https://example.com/")
+   (or title "Example")))
 
 (defun zhihu-test--references (html)
   "Return all native Zhihu reference nodes in HTML."
@@ -370,24 +376,12 @@
             "</div>\n")))
          (raw-dom
           (zhihu--parse-html
-           (concat "<html><body>" raw-html "</body></html>")))
-         (org-html
-          (zhihu--org->html
-           "#+begin_quote\n[!WARNING]\nOrg body.\n#+end_quote\n"))
-         (org-dom
-          (zhihu--parse-html
-           (concat "<html><body>" org-html "</body></html>")))
-         (org-quote (car (dom-by-tag org-dom 'blockquote))))
+           (concat "<html><body>" raw-html "</body></html>"))))
     (should-not (dom-by-tag raw-dom 'blockquote))
     (should
      (cl-find-if
       (lambda (node) (zhihu--node-has-class-p node "warning"))
-      (dom-by-tag raw-dom 'div)))
-    (should org-quote)
-    (should (string-match-p
-             (regexp-quote "[!WARNING]")
-             (dom-inner-text org-quote)))
-    (should-not (dom-by-tag org-quote 'strong))))
+      (dom-by-tag raw-dom 'div)))))
 
 (ert-deftest zhihu-markdown-mermaid-fences-render-png-images ()
   (skip-unless (executable-find "pandoc"))
@@ -427,33 +421,6 @@
             (should (equal (cdr decoded)
                            zhihu-test--mermaid-png))))))))
 
-(ert-deftest zhihu-org-mermaid-source-block-renders-png-image ()
-  (skip-unless (executable-find "pandoc"))
-  (let (source)
-    (cl-letf
-        (((symbol-function 'zhihu--render-mermaid-png)
-          (lambda (input)
-            (setq source input)
-            zhihu-test--mermaid-png)))
-      (let* ((html
-              (zhihu--org->html
-               (concat
-                "#+begin_src mermaid\n"
-                "flowchart LR\n"
-                "  A --> B\n"
-                "#+end_src\n")))
-             (dom
-              (zhihu--parse-html
-               (concat "<html><body>" html "</body></html>")))
-             (image (car (dom-by-tag dom 'img))))
-        (should (equal source "flowchart LR\n  A --> B\n"))
-        (should image)
-        (should-not (dom-by-tag dom 'pre))
-        (should (equal (dom-attr image 'alt) "Mermaid diagram"))
-        (let ((decoded (zhihu--decode-data-url (dom-attr image 'src))))
-          (should (equal (car decoded) "image/png"))
-          (should (equal (cdr decoded) zhihu-test--mermaid-png)))))))
-
 (ert-deftest zhihu-mermaid-rendering-is-language-specific ()
   (skip-unless (executable-find "pandoc"))
   (cl-letf
@@ -464,51 +431,7 @@
      (string-match-p
       (regexp-quote "<pre lang=\"mermaid-js\">")
       (zhihu--md->html
-       "```mermaid-js\nflowchart LR\n  A --> B\n```\n")))
-    (should
-     (string-match-p
-      (regexp-quote "<pre lang=\"mermaid-js\">")
-      (zhihu--org->html
-       "#+begin_src mermaid-js\nflowchart LR\n  A --> B\n#+end_src\n")))))
-
-(ert-deftest zhihu-markdown-and-org-task-lists-degrade-to-glyphs ()
-  (skip-unless (executable-find "pandoc"))
-  (dolist
-      (html
-       (list
-        (zhihu--md->html "- [x] done\n- [ ] todo\n")
-        (zhihu--org->html "- [X] done\n- [ ] todo\n")))
-    (let* ((dom
-            (zhihu--parse-html
-             (concat "<html><body>" html "</body></html>")))
-           (lists (dom-by-tag dom 'ul))
-           (items (dom-by-tag dom 'li)))
-      (should (= (length lists) 1))
-      (should (= (length items) 2))
-      (should-not (dom-by-tag dom 'input))
-      (should-not (dom-by-tag dom 'label))
-      (should-not (dom-attr (car lists) 'class))
-      (should (equal (mapcar #'dom-inner-text items)
-                     '("☑ done" "☐ todo"))))))
-
-(ert-deftest zhihu-task-list-normalization-preserves-unrelated-classes ()
-  (let* ((html
-          (zhihu--zhihuify-html
-           (concat
-            "<ul class=\"other task-list\">"
-            "<li class=\"task-list-item kept\">"
-            "<label><input type=\"checkbox\" checked>done</label>"
-            "</li></ul>")))
-         (dom
-          (zhihu--parse-html
-           (concat "<html><body>" html "</body></html>")))
-         (list-node (car (dom-by-tag dom 'ul)))
-         (item (car (dom-by-tag dom 'li))))
-    (should (equal (dom-attr list-node 'class) "other"))
-    (should (equal (dom-attr item 'class) "kept"))
-    (should-not (dom-by-tag dom 'input))
-    (should-not (dom-by-tag dom 'label))
-    (should (equal (dom-inner-text item) "☑ done"))))
+       "```mermaid-js\nflowchart LR\n  A --> B\n```\n")))))
 
 (ert-deftest zhihu-source-figure-captions-use-native-image-annotations ()
   (skip-unless (executable-find "pandoc"))
@@ -517,9 +440,6 @@
            (concat
             "![图 1：独占段落图片](block.svg)\n\n"
             "正文中的 ![替代文字](inline.svg) 图片。\n")))
-         (org
-          (zhihu--org->html
-           "#+CAPTION: 图 2：Org 图片\n[[file:org.svg]]\n"))
          (typst-html
           (zhihu--normalize-html
            (concat
@@ -532,9 +452,6 @@
          `((,markdown
             ("图 1：独占段落图片")
             ("block.svg"))
-           (,org
-            ("图 2：Org 图片")
-            ("org.svg"))
            (,typst-html
             ("Figure 1: Typst 图")
             ("typst.svg"))))
@@ -802,21 +719,6 @@
              html))
     (should-not (string-match-p "Metadata title\\|question-id\\|zhihu:" html))))
 
-(ert-deftest zhihu-org-pandoc-shifts-the-whole-heading-hierarchy ()
-  (skip-unless (executable-find "pandoc"))
-  ;; Markdown 的开关不得改变 Org 的通常导出层级。
-  (let ((zhihu-enable-markdown-heading-level-shift nil))
-    (let ((html
-           (zhihu--org->html
-            "#+TITLE: Metadata title\n* Top level\n** Nested level\n")))
-      (should (string-match-p
-               "<h2\\(?: [^>]*\\)?>Top level</h2>"
-               html))
-      (should (string-match-p
-               "<h3\\(?: [^>]*\\)?>Nested level</h3>"
-               html))
-      (should-not (string-match-p "Metadata title" html)))))
-
 (ert-deftest zhihu-markdown-heading-shift-can-be-disabled ()
   (skip-unless (executable-find "pandoc"))
   (let* ((zhihu-enable-markdown-heading-level-shift nil)
@@ -842,40 +744,6 @@
     (should (string-match-p
              "<h3\\(?: [^>]*\\)?>Nested level</h3>"
              html))))
-
-(ert-deftest zhihu-markdown-and-org-preserve-stable-section-links ()
-  (skip-unless
-   (and
-    (executable-find "pandoc")
-    (zhihu-test--pandoc-reader-extension-p "gfm" "attributes")))
-  (dolist
-      (html
-       (list
-        (zhihu--md->html
-         (concat
-          "# 开头 {#stable-start}\n\n"
-          "[转到结论](#stable-conclusion)\n\n"
-          "## 结论 {#stable-conclusion}\n"))
-        (zhihu--org->html
-         (concat
-          "* 开头\n"
-          ":PROPERTIES:\n"
-          ":CUSTOM_ID: stable-start\n"
-          ":END:\n\n"
-          "[[#stable-conclusion][转到结论]]\n\n"
-          "** 结论\n"
-          ":PROPERTIES:\n"
-          ":CUSTOM_ID: stable-conclusion\n"
-          ":END:\n"))))
-    (let* ((dom
-            (zhihu--parse-html
-             (concat "<html><body>" html "</body></html>")))
-           (h2 (car (dom-by-tag dom 'h2)))
-           (h3 (car (dom-by-tag dom 'h3)))
-           (anchor (zhihu-test--only-anchor html)))
-      (should (equal (dom-attr h2 'id) "stable-start"))
-      (should (equal (dom-attr h3 'id) "stable-conclusion"))
-      (should (equal (dom-attr anchor 'href) "#stable-conclusion")))))
 
 (ert-deftest zhihu-typst-preserves-stable-section-links ()
   (skip-unless
@@ -1069,22 +937,6 @@
       (should (= messages (if (string-suffix-p ".typ" file) 1 0)))
       (should (zerop converted)))))
 
-(ert-deftest zhihu-markdown-and-org-thematic-breaks-use-hr ()
-  (skip-unless (executable-find "pandoc"))
-  (dolist
-      (html
-       (list
-        (zhihu--md->html "Before\n\n---\n\nAfter\n")
-        (zhihu--org->html "Before\n\n-----\n\nAfter\n")))
-    (let* ((dom
-            (zhihu--parse-html
-             (concat "<html><body>" html "</body></html>")))
-           (body (car (dom-by-tag dom 'body)))
-           (elements (cl-remove-if-not #'consp (dom-children body))))
-      (should (equal (mapcar #'dom-tag elements) '(p hr p)))
-      (should (equal (dom-inner-text (nth 0 elements)) "Before"))
-      (should (equal (dom-inner-text (nth 2 elements)) "After")))))
-
 (ert-deftest zhihu-typst-divider-produces-hr ()
   (skip-unless (and (executable-find "typst")
                     (executable-find "pandoc")))
@@ -1106,85 +958,24 @@
        (should (equal (dom-inner-text (nth 0 elements)) "Before"))
        (should (equal (dom-inner-text (nth 2 elements)) "After"))))))
 
-(ert-deftest zhihu-markdown-and-org-card-links-use-the-same-html ()
-  (skip-unless (executable-find "pandoc"))
-  (dolist
-      (html
-       (list
-        (zhihu--md->html
-         "[Git *Hub*](https://example.com/a?x=1&y=2 \"card\")\n")
-        (zhihu--org->html
-         (concat
-          "#+ATTR_ZHIHU: :type link-card\n"
-          "[[https://example.com/a?x=1&y=2][Git /Hub/]]\n"))))
-    (let ((anchor
-           (zhihu-test--link-card
-            html "https://example.com/a?x=1&y=2" "Git Hub")))
-      (should
-       (equal (string-join (split-string (dom-inner-text anchor) nil t) " ")
-              "Git Hub"))
-      (should (car (dom-by-tag anchor 'em))))))
-
-(ert-deftest zhihu-typst-card-link-function-produces-link-card ()
+(ert-deftest zhihu-typst-h-cite-produces-link-card ()
   (skip-unless (and (executable-find "typst")
                     (executable-find "pandoc")))
   (zhihu-test--with-temp-file
    ".typ"
    (concat
     "#set document(title: \"Card test\")\n"
-    "#let card-link(url, body) = context {\n"
-    "  if target() == \"html\" {\n"
-    "    html.elem(\"a\", attrs: (\n"
-    "      href: url,\n"
-    "      \"data-zhihu-card\": \"\",\n"
-    "    ), body)\n"
-    "  } else {\n"
-    "    link(url, body)\n"
-    "  }\n"
-    "}\n\n"
-    "#card-link(\"https://example.com/a?x=1&y=2\")[Git #emph[Hub]]\n")
+    "#html.elem(\"div\", attrs: (class: \"h-cite\"),\n"
+    "  html.elem(\"a\", attrs: (\n"
+    "    class: \"u-url p-name\",\n"
+    "    href: \"https://example.com/a?x=1&y=2\",\n"
+    "  ), text(\"Git Hub\")))\n")
    (lambda (file)
      (let* ((html (zhihu--source-to-html file))
             (anchor
              (zhihu-test--link-card
               html "https://example.com/a?x=1&y=2" "Git Hub")))
-       (should
-        (equal (string-join (split-string (dom-inner-text anchor) nil t) " ")
-               "Git Hub"))
-       (should (car (dom-by-tag anchor 'em)))))))
-
-(ert-deftest zhihu-markdown-and-org-footnotes-use-native-references ()
-  (skip-unless (executable-find "pandoc"))
-  (dolist
-      (html
-       (list
-        (zhihu--md->html
-         (concat
-          "首次[^paper]，再次[^paper]，另见[^plain]。\n\n"
-          "[^paper]: 参见 [论文标题](https://example.com/paper?a=1&b=2)。\n\n"
-          "[^plain]: 纯文字说明。\n"))
-        (zhihu--org->html
-         (concat
-          "首次[fn:paper]，再次[fn:paper]，另见[fn:plain]。\n\n"
-          "[fn:paper] 参见 [[https://example.com/paper?a=1&b=2]"
-          "[论文标题]]。\n"
-          "[fn:plain] 纯文字说明。\n"))))
-    (let ((references (zhihu-test--references html)))
-      (should (= (length references) 3))
-      (zhihu-test--assert-reference
-       (nth 0 references) 1 "参见 论文标题。" "https://example.com/paper?a=1&b=2")
-      (zhihu-test--assert-reference
-       (nth 1 references) 1 "参见 论文标题。" "https://example.com/paper?a=1&b=2")
-      (zhihu-test--assert-reference
-       (nth 2 references) 2 "纯文字说明。" "")
-      (should-not (string-match-p "doc-endnotes\\|footnote-back\\|data-zhihu-reference"
-                                  html)))))
-
-(ert-deftest zhihu-org-inline-footnote-uses-native-reference ()
-  (skip-unless (executable-find "pandoc"))
-  (let* ((html (zhihu--org->html "正文[fn::纯文字说明]。\n"))
-         (reference (car (zhihu-test--references html))))
-    (zhihu-test--assert-reference reference 1 "纯文字说明" "")))
+       (should (equal (dom-inner-text anchor) "Git Hub"))))))
 
 (ert-deftest zhihu-typst-native-footnotes-use-native-references ()
   (skip-unless (and (executable-find "typst")
@@ -1258,36 +1049,33 @@
   (let ((html "<!DOCTYPE html><html><body><p>正文</p></body></html>"))
     (should (eq (zhihu--typst-rewrite-footnotes html) html))))
 
-(ert-deftest zhihu-card-link-markers-require-a-standalone-web-link ()
+(ert-deftest zhihu-h-cite-link-cards-work-from-markdown-and-html ()
   (skip-unless (executable-find "pandoc"))
-  (dolist
-      (markdown
-       '("before [GitHub](https://example.com \"card\") after\n"
-         "[GitHub](/relative \"card\")\n"
-         "[](https://example.com \"card\")\n"))
-    (should-error (zhihu--md->html markdown)))
-  (dolist
-      (org
-       '("#+ATTR_ZHIHU: :type link-card\n"
-         "#+ATTR_ZHIHU: :type link-card\nbefore [[https://example.com][GitHub]]\n"
-         "#+ATTR_ZHIHU: :type link-card\n[[/relative][GitHub]]\n"
-         "#+ATTR_ZHIHU: :type\n[[https://example.com][GitHub]]\n"))
-    (should-error (zhihu--org->html org))))
+  (let ((card (zhihu-test--h-cite-html
+               "https://example.com/a?x=1&amp;y=2" "Git Hub")))
+    (dolist (html (list (zhihu--md->html card)
+                        (zhihu--normalize-html card)))
+      (zhihu-test--link-card
+       html "https://example.com/a?x=1&y=2" "Git Hub"))))
 
-(ert-deftest zhihu-card-link-filter-leaves-unmarked-links-alone ()
-  (skip-unless (executable-find "pandoc"))
+(ert-deftest zhihu-h-cite-requires-strict-top-level-properties ()
   (dolist
       (html
        (list
-        (zhihu--md->html
-         "[GitHub](https://example.com \"cardinal\")\n")
-        (zhihu--org->html
-         (concat
-          "#+ATTR_ZHIHU: :type future-extension\n"
-          "[[https://example.com][GitHub]]\n"))))
+        (concat "<section>before " (zhihu-test--h-cite-html) " after</section>")
+        "<cite class=\"h-cite\"><a class=\"p-name\" href=\"https://example.com\">Example</a></cite>"
+        "<cite class=\"h-cite\"><a class=\"u-url p-name\" href=\"/relative\">Example</a></cite>"
+        "<cite class=\"h-cite\"><a class=\"u-url\" href=\"https://example.com\"></a><span class=\"p-name\"></span></cite>"))
+    (should-error (zhihu--zhihuify-html html))))
+
+(ert-deftest zhihu-card-title-is-an-ordinary-markdown-link ()
+  (skip-unless (executable-find "pandoc"))
+  (dolist (title '("card" "cardinal"))
+    (let ((html (zhihu--md->html
+                 (format "[GitHub](https://example.com %S)\n" title))))
     (let ((anchor (zhihu-test--only-anchor html)))
       (should (equal (dom-attr anchor 'href) "https://example.com"))
-      (should-not (dom-attr anchor 'data-draft-type)))))
+      (should-not (dom-attr anchor 'data-draft-type))))))
 
 (ert-deftest zhihu-pandoc-filter-temp-file-is-always-removed ()
   (let (filter)
@@ -1297,7 +1085,7 @@
                  (setq filter (cadr (member "--lua-filter" args)))
                  (should (and filter (file-exists-p filter)))
                  (error "conversion failed"))))
-      (should-error (zhihu--pandoc-to-zhihu-html "org" "Body" nil)))
+      (should-error (zhihu--pandoc-to-zhihu-html "gfm" "Body" nil)))
     (should filter)
     (should-not (file-exists-p filter))))
 
@@ -1308,7 +1096,7 @@
      "<pre class=\"python\"><code>x &amp; y</code></pre>")
     "<pre lang=\"python\">x &amp; y</pre>")))
 
-(ert-deftest zhihu-insert-user-mention-supports-all-source-formats ()
+(ert-deftest zhihu-insert-user-mention-supports-source-formats ()
   (let ((first-hash "0123456789abcdef0123456789abcdef")
         (second-hash "fedcba9876543210fedcba9876543210")
         (http-requests 0)
@@ -1368,14 +1156,6 @@
               ,(concat
                 "[@张三](https://www.zhihu.com/people/zhang-san-2 "
                 "\"member_mention_fedcba9876543210fedcba9876543210\")"))
-             (org
-              "/tmp/test.org"
-              ,(concat
-                "@@html:<a href=\"https://www.zhihu.com/people/"
-                "zhang-san-2\" "
-                "title=\"member_mention_"
-                "fedcba9876543210fedcba9876543210\">"
-                "&#64;张三</a>@@"))
              (typst
               "/tmp/test.typ"
               ,(concat
@@ -1398,9 +1178,6 @@
                     ('markdown
                      (when (executable-find "pandoc")
                        (zhihu--md->html source)))
-                    ('org
-                     (when (executable-find "pandoc")
-                       (zhihu--org->html source)))
                     ('typst
                      (when (and (executable-find "typst")
                                 (executable-find "pandoc"))
@@ -1417,8 +1194,8 @@
                 (should
                  (equal (dom-attr anchor 'data-hash)
                         second-hash)))))))
-      (should (= http-requests 3))
-      (should (= selection-requests 3)))))
+      (should (= http-requests 2))
+      (should (= selection-requests 2)))))
 
 (ert-deftest zhihu-column-completion-labels-disambiguate-collisions ()
   (let* ((columns
@@ -1655,17 +1432,13 @@
       (should-not (zhihu--typst-metadata-key-context))
       (should-not (zhihu-completion-at-point)))))
 
-(ert-deftest zhihu-column-id-capf-writes-id-in-all-source-formats ()
+(ert-deftest zhihu-column-id-capf-writes-id-in-source-formats ()
   (dolist
       (case
        '((markdown
           "/tmp/article.md"
           "---\ntitle: A\nzhihu:\n  article-id:\n  column-id:\n---\n"
           "  column-id: \"writers\"")
-         (org
-          "/tmp/article.org"
-          "#+TITLE: A\n#+ZHIHU_ARTICLE_ID:\n#+ZHIHU_COLUMN_ID:\n"
-          "#+ZHIHU_COLUMN_ID: writers")
          (typst
           "/tmp/article.typ"
           "#metadata((\n  article-id: none,\n  column-id: ,\n)) <zhihu>\n"
@@ -1673,15 +1446,8 @@
     (with-temp-buffer
       (setq buffer-file-name (nth 1 case))
       (insert (nth 2 case))
-      (when (eq (car case) 'org)
-        (require 'org)
-        (delay-mode-hooks (org-mode)))
       (goto-char (point-min))
-      (search-forward
-       (if (eq (car case) 'org)
-           "COLUMN_ID:"
-         "column-id:")
-       nil t)
+      (search-forward "column-id:" nil t)
       (unless (eq (car case) 'typst)
         (end-of-line))
       (let ((requests 0))
@@ -1734,15 +1500,6 @@
       (goto-char (point-min))
       (search-forward "column-id:")
       (should-not (zhihu--markdown-column-id-context))))
-  (with-temp-buffer
-    (setq buffer-file-name "/tmp/article.org")
-    (insert
-     "#+begin_quote\n#+ZHIHU_COLUMN_ID:\n#+end_quote\n")
-    (require 'org)
-    (delay-mode-hooks (org-mode))
-    (goto-char (point-min))
-    (search-forward "COLUMN_ID:")
-    (should-not (zhihu--org-column-id-context)))
   (dolist
       (source
        '("#metadata((nested: (column-id: \"x\"),)) <zhihu>\n"
@@ -1914,7 +1671,6 @@
 (ert-deftest zhihu-mode-has-no-global-auto-detection ()
   (should-not (fboundp 'zhihu--maybe-enable-mode))
   (dolist (hook '(markdown-mode-hook
-                  org-mode-hook
                   typst-ts-mode-hook
                   typst-mode-hook))
     (should-not
@@ -1922,7 +1678,7 @@
           (memq #'zhihu--maybe-enable-mode
                 (symbol-value hook))))))
 
-(ert-deftest zhihu-topic-capf-writes-names-in-all-source-formats ()
+(ert-deftest zhihu-topic-capf-writes-names-in-source-formats ()
   (dolist
       (case
        (list
@@ -1946,15 +1702,6 @@
           "    - \"Emacs \\\"Lisp\\\"\" # keep\n"
           "---\nBody\n"))
         (list
-         'org
-         "/tmp/article.org"
-         (concat
-          "#+ZHIHU_ARTICLE_ID:\n"
-          "#+ZHIHU_TOPICS: [\"Other\", \"Em\"]\n")
-         (concat
-          "#+ZHIHU_ARTICLE_ID:\n"
-          "#+ZHIHU_TOPICS: [\"Other\", \"Emacs \\\"Lisp\\\"\"]\n"))
-        (list
          'typst
          "/tmp/article.typ"
          (concat
@@ -1966,9 +1713,6 @@
     (with-temp-buffer
       (setq buffer-file-name (nth 1 case))
       (insert (nth 2 case))
-      (when (eq (car case) 'org)
-        (require 'org)
-        (delay-mode-hooks (org-mode)))
       (goto-char (point-min))
       (search-forward "\"Em")
       (let ((searches 0))
@@ -2001,14 +1745,6 @@
               (concat
                "---\nzhihu:\n  article-id:\n  thought-id:\n"
                "  topics:\n    - \"No\"\n---\n"))
-        (list 'org "/tmp/answer.org"
-              (concat
-               "#+ZHIHU_QUESTION_ID: 123\n"
-               "#+ZHIHU_TOPICS: [\"No\"]\n"))
-        (list 'org "/tmp/mixed.org"
-              (concat
-               "#+ZHIHU_ARTICLE_ID:\n#+ZHIHU_THOUGHT_ID:\n"
-               "#+ZHIHU_TOPICS: [\"No\"]\n"))
         (list 'typst "/tmp/answer.typ"
               (concat
                "#metadata((question-id: \"123\", "
@@ -2020,9 +1756,6 @@
     (with-temp-buffer
       (setq buffer-file-name (nth 1 case))
       (insert (nth 2 case))
-      (when (eq (car case) 'org)
-        (require 'org)
-        (delay-mode-hooks (org-mode)))
       (goto-char (point-min))
       (search-forward "\"No")
       (let ((searches 0))
@@ -2071,16 +1804,14 @@
 (ert-deftest zhihu-pin-topic-capf-allows-tenth-item-and-rejects-eleventh ()
   (dolist (count '(10 11))
     (with-temp-buffer
-      (setq buffer-file-name "/tmp/pin.org")
+      (setq buffer-file-name "/tmp/pin.md")
       (insert
-       "#+ZHIHU_THOUGHT_ID:\n#+ZHIHU_TOPICS: ["
+       "---\nzhihu:\n  thought-id:\n  topics:\n"
        (mapconcat
-        (lambda (index) (format "\"T%d\"" index))
+        (lambda (index) (format "    - \"T%d\"" index))
         (number-sequence 1 count)
-        ", ")
-       "]\n")
-      (require 'org)
-      (delay-mode-hooks (org-mode))
+        "\n")
+       "\n---\n")
       (goto-char (point-min))
       (search-forward (format "\"T%d" count))
       (let ((searches 0))
@@ -2098,7 +1829,7 @@
                   (should (= searches 1))
                   (should
                    (string-match-p
-                    (regexp-quote "\"T9\", \"Replacement\"]")
+                    (regexp-quote "    - \"Replacement\"")
                     (buffer-string))))
               (should-not capf)
               (should (= searches 0)))))))))
@@ -2745,29 +2476,18 @@
              "zhihu:\n"
              "  article-id:\n"
              "---\n\n")))
-    (should
-     (equal (zhihu--format-new-source-metadata 'org article)
-            "#+TITLE: Article\n#+ZHIHU_ARTICLE_ID:\n\n"))
-    (dolist (format '(typst markdown org))
+    (dolist (format '(typst markdown))
       (let ((source (zhihu--format-new-source-metadata format answer)))
-        (should (string-match-p
-                 (if (eq format 'org)
-                     "ZHIHU_QUESTION_ID: 123"
-                   "question-id: \"123\"")
-                 source))
+        (should (string-match-p "question-id: \"123\"" source))
         (should-not
-         (string-match-p
-          (if (eq format 'org) "ZHIHU_ANSWER_ID" "answer-id")
-          source))))
-    (dolist (format '(typst markdown org))
+         (string-match-p "answer-id" source))))
+    (dolist (format '(typst markdown))
       (let ((source (zhihu--format-new-source-metadata format pin)))
         (should
          (string-match-p
-          (if (eq format 'org)
-              "ZHIHU_THOUGHT_ID:[[:space:]]*$"
-            (if (eq format 'typst)
-                "thought-id: none"
-              "thought-id:[[:space:]]*$"))
+          (if (eq format 'typst)
+              "thought-id: none"
+            "thought-id:[[:space:]]*$")
           source))))))
 
 (ert-deftest zhihu-new-source-writes-canonical-generic-document-fields ()
@@ -2797,21 +2517,13 @@
        "zhihu:\n"
        "  article-id:\n"
        "---\n\n")))
-    (should
-     (equal
-      (zhihu--format-new-source-metadata 'org article)
-      (concat
-       "#+TITLE: Article\n"
-       "#+BANNER: ./cover.jpg\n"
-       "#+TOC: headlines 2\n"
-       "#+ZHIHU_ARTICLE_ID:\n\n")))))
+    ))
 
 (ert-deftest zhihu-pin-metadata-round-trips-all-source-formats ()
   (let ((meta
          (zhihu--source-meta-from-parts '(:thought-id "456" :topics ["Emacs" "org-mode"] :comment-permission "follower_n_days") "Pin title" "./banner.png")))
     (dolist (case '((typst . ".typ")
-                    (markdown . ".md")
-                    (org . ".org")))
+                    (markdown . ".md")))
       (pcase-let ((`(,format . ,suffix) case))
         (zhihu-test--with-temp-file
          suffix
@@ -2837,8 +2549,7 @@
       (let ((meta
              (zhihu--source-meta-from-parts (list field nil) "Title" nil)))
         (dolist (case '((typst . ".typ")
-                        (markdown . ".md")
-                        (org . ".org")))
+                        (markdown . ".md")))
           (pcase-let ((`(,format . ,suffix) case))
             (let* ((field-name (substring (symbol-name field) 1))
                    (source
@@ -2846,11 +2557,7 @@
                    (empty-marker
                     (pcase format
                       ('typst (format "  %s: none," field-name))
-                      ('markdown (format "  %s:" field-name))
-                      ('org
-                       (format
-                        "#+%s:"
-                        (zhihu--org-metadata-keyword field))))))
+                      ('markdown (format "  %s:" field-name)))))
               (should
                (string-match-p
                 (concat "^" (regexp-quote empty-marker) "$")
@@ -2887,22 +2594,6 @@
       (regexp-quote
        "必须且只能包含 question-id、article-id 或 thought-id 中的一个")
       message)))
-  (zhihu-test--with-temp-file
-   ".org"
-   "#+TITLE: Org\n\nBody\n"
-   (lambda (file)
-     (let ((message
-            (condition-case err
-                (progn
-                  (zhihu--org-read-meta file)
-                  nil)
-              (error (error-message-string err)))))
-       (should message)
-       (should
-        (string-match-p
-         (regexp-quote
-          "必须且只能包含 question-id、article-id 或 thought-id 中的一个")
-         message)))))
   (cl-letf (((symbol-function 'zhihu--typst-query-metadata)
              (lambda (_file) nil)))
     (let ((message
@@ -2938,15 +2629,7 @@ other: keep\n---\nBody\n"
                ,#'zhihu--md-write-zhihu-meta
                "article-id: \"456\""
                "article-id:"
-               "banner: \"./cover.jpg\""))
-           (".org"
-            . ("#+TITLE: Title\n#+BANNER: ./cover.jpg\n\
-#+ZHIHU_ARTICLE_ID: 456\n\
-#+OTHER: keep\n\nBody\n"
-               ,#'zhihu--org-write-zhihu-meta
-               "ZHIHU_ARTICLE_ID: 456"
-               "ZHIHU_ARTICLE_ID:"
-               "#+BANNER: ./cover.jpg"))))
+               "banner: \"./cover.jpg\""))))
       (pcase-let
           ((`(,suffix
               . (,source ,writer ,old-marker ,empty-marker ,banner-marker))
@@ -3195,207 +2878,6 @@ other: keep\n---\nBody\n"
          "banner: one\nbanner: two\nzhihu:\n  article-id:\n"
          "'banner': one\n\"banner\": two\nzhihu:\n  article-id:\n"))
     (should-error (zhihu--md-parse-frontmatter-meta frontmatter))))
-
-(ert-deftest zhihu-org-rejects-empty-and-duplicate-keywords ()
-  (dolist
-      (source
-       '("#+TITLE: Test\n#+ZHIHU_QUESTION_ID:\n"
-         "#+TITLE: Test\n#+ZHIHU_QUESTION_ID:   \n"
-         "#+TITLE: Test\n#+ZHIHU_QUESTION_ID: 123\n\
-#+ZHIHU_QUESTION_ID: 456\n"
-         "#+TITLE: Test\n#+ZHIHU_QUESTION_ID: 123\n\
-#+zhihu_question_id: 456\n"))
-    (zhihu-test--with-temp-file
-     ".org"
-     source
-     (lambda (file)
-       (should-error (zhihu--org-read-meta file))))))
-
-(ert-deftest zhihu-org-banner-is-generic-only-and-strict ()
-  (zhihu-test--with-temp-file
-   ".org"
-   (concat
-    "#+TITLE: Test\n"
-    "#+BANNER: ./canonical.jpg\n"
-    "#+ZHIHU_QUESTION_ID: 123\n"
-    "#+ZHIHU_BANNER: ./ignored.jpg\n")
-   (lambda (file)
-     (let ((meta (zhihu--org-read-meta file)))
-       (should (eq (plist-get meta :kind) 'answer))
-       (should (equal (plist-get meta :banner) "./canonical.jpg")))))
-  (zhihu-test--with-temp-file
-   ".org"
-   "#+TITLE: Test\n#+ZHIHU_BANNER: ./ignored.jpg\n#+ZHIHU_ARTICLE_ID:\n"
-   (lambda (file)
-     (should-not (plist-get (zhihu--org-read-meta file) :banner))))
-  (dolist
-      (source
-       '("#+TITLE: Test\n#+ZHIHU_ARTICLE_ID:\n#+BANNER:\n"
-         "#+TITLE: Test\n#+ZHIHU_ARTICLE_ID:\n\
-#+BANNER: one\n#+banner: two\n"))
-    (zhihu-test--with-temp-file
-     ".org" source
-     (lambda (file)
-       (should-error (zhihu--org-read-meta file))))))
-
-(ert-deftest zhihu-org-native-toc-is-strict-and-channel-independent ()
-  (dolist (value '("headlines" "headlines 1" "HEADLINES 2" "headlines 3"))
-    (zhihu-test--with-temp-file
-     ".org"
-     (format
-      "#+TITLE: Test\n#+TOC: %s\n#+ZHIHU_ARTICLE_ID:\n"
-      value)
-     (lambda (file)
-       (should (plist-get (zhihu--org-read-meta file) :toc)))))
-  (zhihu-test--with-temp-file
-   ".org"
-   "#+TITLE: Test\n#+TOC: headlines 2\n#+ZHIHU_QUESTION_ID: 123\n"
-   (lambda (file)
-     (let ((meta (zhihu--org-read-meta file)))
-       (should (eq (plist-get meta :kind) 'answer))
-       (should (plist-get meta :toc)))))
-  (dolist
-      (source
-       '("#+TITLE: Test\n#+TOC:\n#+ZHIHU_ARTICLE_ID:\n"
-         "#+TITLE: Test\n#+TOC: headlines 0\n#+ZHIHU_ARTICLE_ID:\n"
-         "#+TITLE: Test\n#+TOC: headlines 4\n#+ZHIHU_ARTICLE_ID:\n"
-         "#+TITLE: Test\n#+TOC: contents\n#+ZHIHU_ARTICLE_ID:\n"
-         "#+TITLE: Test\n#+TOC: headlines 1 2\n#+ZHIHU_ARTICLE_ID:\n"
-         "#+TITLE: Test\n#+TOC: headlines 1\n\
-#+toc: headlines 2\n#+ZHIHU_ARTICLE_ID:\n"))
-    (zhihu-test--with-temp-file
-     ".org" source
-     (lambda (file)
-       (should-error (zhihu--org-read-meta file))))))
-
-(ert-deftest zhihu-org-ignores-keywords-in-source-blocks ()
-  (zhihu-test--with-temp-file
-   ".org"
-   (concat
-    "#+TITLE: Test\n"
-    "#+ZHIHU_ARTICLE_ID:\n"
-    "#+begin_src org\n"
-    "#+BANNER:\n"
-    "#+BANNER: ./inside-source-block.jpg\n"
-    "#+TOC: headlines 2\n"
-    "#+ZHIHU_QUESTION_ID:\n"
-    "#+ZHIHU_QUESTION_ID: 123\n"
-    "#+end_src\n")
-   (lambda (file)
-     (let ((meta (zhihu--org-read-meta file)))
-       (should (eq (plist-get meta :kind) 'article))
-       (should-not (plist-get meta :banner))
-       (should-not (plist-get meta :toc))
-       (should-not (plist-get meta :question-id))))))
-
-(ert-deftest zhihu-org-publish-settings-round-trip ()
-  (zhihu-test--with-temp-file
-   ".org"
-   (concat
-    "#+TITLE: Test\n"
-    "#+BANNER: ./images/cover.jpg\n"
-    "#+TOC: headlines 2\n"
-    "#+ZHIHU_ARTICLE_ID: 456\n"
-    "#+ZHIHU_CREATION_STATEMENT: medical_advice\n"
-    "#+ZHIHU_CONTENT_SOURCE: printMedia\n"
-    "#+ZHIHU_REPRINT_PERMISSION: disallowed\n"
-    "#+ZHIHU_COMMENT_PERMISSION: censor\n"
-    "\n正文\n")
-   (lambda (file)
-     (let ((meta (zhihu--org-read-meta file)))
-       (should
-        (equal
-         (mapcar (lambda (key) (plist-get meta key))
-                 '(:banner :creation-statement :content-source
-			   :toc
-			   :reprint-permission :comment-permission))
-         '("./images/cover.jpg" "medical_advice" "printMedia"
-           t "disallowed" "censor")))
-       (zhihu--org-write-zhihu-meta file meta)
-       (let ((round-tripped (zhihu--org-read-meta file)))
-         (should
-          (equal
-           (mapcar (lambda (key) (plist-get round-tripped key))
-                   '(:banner :creation-statement :content-source
-			     :toc
-			     :reprint-permission :comment-permission))
-           '("./images/cover.jpg" "medical_advice" "printMedia"
-             t "disallowed" "censor"))))
-       (dolist (key
-                '(:creation-statement :content-source
-				      :reprint-permission :comment-permission))
-         (setq meta (plist-put meta key nil)))
-       (zhihu--org-write-zhihu-meta file meta)
-       (let ((source
-              (with-temp-buffer
-                (insert-file-contents file)
-                (buffer-string))))
-         (dolist
-             (keyword
-              '("ZHIHU_CREATION_STATEMENT"
-                "ZHIHU_CONTENT_SOURCE"
-                "ZHIHU_REPRINT_PERMISSION" "ZHIHU_COMMENT_PERMISSION"))
-           (should-not (string-match-p keyword source)))
-         (should
-          (string-match-p
-           (regexp-quote "#+TOC: headlines 2")
-           source))
-         (should-not (string-match-p "ZHIHU_.*TOC" source))
-         (should
-          (string-match-p
-           (regexp-quote "#+BANNER: ./images/cover.jpg")
-           source)))))))
-
-(ert-deftest zhihu-org-article-topics-round-trip-and-remove ()
-  (zhihu-test--with-temp-file
-   ".org"
-   (concat
-    "#+TITLE: Test\n"
-    "#+ZHIHU_ARTICLE_ID: 456\n"
-    "#+ZHIHU_TOPICS: [\"123\",\"comma, quote\\\"\"]\n"
-    "#+OTHER: keep\n\n正文\n")
-   (lambda (file)
-     (let ((meta (zhihu--org-read-meta file)))
-       (should
-        (equal (plist-get meta :topics)
-               '("123" "comma, quote\"")))
-       (zhihu--org-write-zhihu-meta file meta)
-       (should
-        (equal (plist-get (zhihu--org-read-meta file) :topics)
-               '("123" "comma, quote\"")))
-       (setq meta (plist-put meta :topics nil))
-       (zhihu--org-write-zhihu-meta file meta)
-       (let ((source
-              (with-temp-buffer
-                (insert-file-contents file)
-                (buffer-string))))
-         (should-not (string-match-p "ZHIHU_TOPICS" source))
-         (should
-          (string-match-p (regexp-quote "#+OTHER: keep") source))
-         (should (string-match-p "正文" source)))))))
-
-(ert-deftest zhihu-org-rejects-invalid-article-topics ()
-  (dolist
-      (raw
-       '("[]"
-         "null"
-         "\"Emacs\""
-         "{\"name\":\"Emacs\"}"
-         "[\"Emacs\",42]"
-         "["))
-    (zhihu-test--with-temp-file
-     ".org"
-     (format
-      "#+TITLE: Test\n#+ZHIHU_ARTICLE_ID:\n#+ZHIHU_TOPICS: %s\n"
-      raw)
-     (lambda (file)
-       (should-error (zhihu--org-read-meta file)))))
-  (zhihu-test--with-temp-file
-   ".org"
-   "#+ZHIHU_ARTICLE_ID:\n\
-#+ZHIHU_TOPICS: [\"Emacs\"]\n#+zhihu_topics: [\"Org\"]\n"
-   (lambda (file)
-     (should-error (zhihu--org-read-meta file)))))
 
 (ert-deftest zhihu-typst-root-resolves-all-absolute-imports-together ()
   (let* ((root (make-temp-file "zhihu-test-typst-root-" t))

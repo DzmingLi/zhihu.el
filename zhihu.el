@@ -114,9 +114,8 @@ https://www.zhihu.com/creator/editor-setting 的设置项。"
 (defcustom zhihu-enable-markdown-heading-level-shift t
   "发布 Markdown 源稿时是否把正文标题整体下移一级。
 非 nil 时，正文一级标题输出为 HTML `h2'，为知乎页面标题保留 `h1'；
-nil 时保留源稿的自然标题层级。Org 按其通常的 HTML 导出实践固定从
-`h2' 开始；Typst 的 HTML 导出已经区分文档标题与正文标题。两者都不受
-此选项影响。"
+nil 时保留源稿的自然标题层级。Typst 的 HTML 导出已经区分文档标题与
+正文标题，不受此选项影响。"
   :type 'boolean
   :group 'zhihu)
 
@@ -1238,20 +1237,6 @@ METHOD、REFERER 和可选 BODY 直接用于本次请求。"
         result)))
    (t (error "zhihu: 不认识的 id/URL: %s" s))))
 
-;; Typst metadata
-;;
-;;
-;;   #metadata((question-id: "...", answer-id: "...", ...)) <zhihu>
-;;   #metadata("./images/banner.jpg") <banner>
-;;
-
-(declare-function org-collect-keywords "org" (keywords &optional unique directory))
-(declare-function org-element-context "org-element" (&optional element))
-(declare-function org-element-map "org-element" (data types fun &rest args))
-(declare-function org-element-parse-buffer "org-element" (&rest args))
-(declare-function org-element-property
-                  "org-element" (property node &optional dflt force-undefer))
-(declare-function org-element-type "org-element" (element))
 (declare-function markdown-inside-link-p "markdown-mode" ())
 
 (defvar zhihu--typst-syntax-table
@@ -2107,185 +2092,20 @@ BLOCK-ONLY 非 nil 时只匹配值为空、可带行尾注释的 block mapping k
                 "\n")
       "")))
 
-;; Org metadata
-;;
-;; 标题和题图使用标准风格的 `#+TITLE:'、`#+BANNER:'；知乎渠道状态使用包自己的
-;; 关键字：
-;;   #+ZHIHU_QUESTION_ID: 123
-;;   #+ZHIHU_ANSWER_ID: 456
-;; 或：
-;;   #+ZHIHU_ARTICLE_ID: 789
-;;   #+ZHIHU_COLUMN_ID: hackers
-;; QUESTION_ID、ARTICLE_ID 与 THOUGHT_ID 必须且只能出现一个。ARTICLE_ID/THOUGHT_ID
-;; 可以保留空槽，等待首次发布写回；其它知乎关键字出现时必须有非空值。
-;; 话题是单行 JSON array。
 
-(defun zhihu--org-metadata-keyword (field)
-  "把 metadata 关键字 FIELD 转成对应的 Org 关键字名。"
-  (concat
-   "ZHIHU_"
-   (upcase
-    (replace-regexp-in-string
-     "-" "_" (zhihu--metadata-field-name field) t t))))
 
-(defconst zhihu--org-keyword-names
-  (mapcar #'zhihu--org-metadata-keyword
-          (append zhihu--metadata-scalar-fields
-                  '(:topics)))
-  "本包拥有的 Org 文档级关键字。")
 
-(defconst zhihu--org-empty-id-keyword-names
-  (mapcar #'zhihu--org-metadata-keyword
-          zhihu--metadata-empty-id-slot-fields)
-  "允许保留空值、等待首次发布写回的 Org 关键字。")
 
-(defun zhihu--org-collect-keywords (&optional names)
-  "收集当前 buffer 的 NAMES 文档级关键字。
-NAMES 缺省为本包拥有的知乎关键字。
-忽略源码块里的同名文本；重复值立即报错，只有内容 ID 槽允许为空。
-返回 (KEY . VALUE) alist。"
-  (require 'org)
-  (unless (derived-mode-p 'org-mode)
-    (delay-mode-hooks (org-mode)))
-  (mapcar
-   (lambda (entry)
-     (let ((key (car entry))
-           (values (cdr entry)))
-       (unless (= (length values) 1)
-         (error "zhihu: Org 关键字 %s 不能重复" key))
-       (let ((value (string-trim (car values))))
-         (when (and (string-empty-p value)
-                    (not (member key zhihu--org-empty-id-keyword-names)))
-           (error "zhihu: Org 关键字 %s 不能为空" key))
-         (cons key value))))
-   (org-collect-keywords (or names zhihu--org-keyword-names))))
 
-(defun zhihu--org-topics (raw)
-  "把 Org 关键字里的 RAW JSON array 解析为话题名称 sequence。"
-  (let ((topics
-         (condition-case nil
-             (json-parse-string raw
-                                :array-type 'array
-                                :null-object :json-null
-                                :false-object :json-false)
-           (error nil))))
-    (unless (vectorp topics)
-      (error "zhihu: ZHIHU_TOPICS 必须是合法 JSON array"))
-    topics))
 
-(defun zhihu--org-toc-enabled-p (raw)
-  "把 Org 原生 `#+TOC' 的 RAW 值规范化为是否启用文章目录。"
-  (when raw
-    (let ((case-fold-search t))
-      (unless
-          (string-match-p
-           "\\`headlines\\(?:[ \t]+[1-3]\\)?\\'"
-           raw)
-        (error
-         "zhihu: Org 目录只支持 #+TOC: headlines 1..3")))
-    t))
-
-(defun zhihu--org-read-meta (file)
-  "从 Org FILE 读取通用文档 metadata 与知乎 metadata。"
-  (with-temp-buffer
-    (insert-file-contents file)
-    (require 'org)
-    (delay-mode-hooks (org-mode))
-    (let* ((keywords
-            (zhihu--org-collect-keywords
-             (append
-              '("BANNER" "TOC")
-              zhihu--org-keyword-names)))
-           (title
-            (cdr
-             (assoc-string
-              "TITLE"
-              (org-collect-keywords '("TITLE") '("TITLE"))
-              t)))
-           (banner
-            (cdr (assoc-string "BANNER" keywords t)))
-           (toc
-            (zhihu--org-toc-enabled-p
-             (cdr (assoc-string "TOC" keywords t))))
-           z)
-      (dolist (field zhihu--metadata-scalar-fields)
-        (when-let*
-            ((value
-              (cdr
-               (assoc-string
-                (zhihu--org-metadata-keyword field) keywords t))))
-          (setq z (plist-put z field value))))
-      (when-let*
-          ((raw
-            (cdr
-             (assoc-string
-              (zhihu--org-metadata-keyword :topics) keywords t))))
-        (setq z (plist-put z :topics (zhihu--org-topics raw))))
-      (zhihu--source-meta-from-parts z title banner toc))))
-
-(defun zhihu--format-org-zhihu-metadata (meta)
-  "生成 META 对应的 Org `#+ZHIHU_*' metadata 行。"
-  (let* ((topics (plist-get meta :topics))
-         (lines
-         (mapcar
-           (pcase-lambda (`(,field . ,value))
-             (if (null value)
-                 (format "#+%s:"
-                         (zhihu--org-metadata-keyword field))
-               (format "#+%s: %s"
-                       (zhihu--org-metadata-keyword field)
-                       (if (eq value t) "true" value))))
-           (zhihu--metadata-scalar-entries meta))))
-    (when topics
-      (setq lines
-            (append
-             lines
-             (list
-              (format
-               "#+%s: %s"
-               (zhihu--org-metadata-keyword :topics)
-               (json-serialize (vconcat topics)
-                               :null-object :json-null
-                               :false-object :json-false))))))
-    (if lines
-        (concat (mapconcat #'identity lines "\n") "\n")
-      "")))
-
-(defun zhihu--org-write-zhihu-meta (file meta)
-  "把 META 中的知乎渠道字段写入 Org FILE。"
-  (let ((block (zhihu--format-org-zhihu-metadata meta)))
-    (with-temp-buffer
-      (insert-file-contents file)
-      (require 'org)
-      (delay-mode-hooks (org-mode))
-      (let (regions)
-        (org-element-map (org-element-parse-buffer) 'keyword
-			 (lambda (node)
-			   (when (member (org-element-property :key node)
-					 zhihu--org-keyword-names)
-			     (let ((begin (org-element-property :begin node)))
-			       (push (cons begin
-					   (save-excursion
-					     (goto-char begin)
-					     (line-beginning-position 2)))
-				     regions)))))
-        (dolist (region (sort regions (lambda (a b) (> (car a) (car b)))))
-          (delete-region (car region) (cdr region))))
-      (goto-char (point-min))
-      (let ((case-fold-search t))
-        (while (looking-at "^#\\+[[:alnum:]_]+:.*\n")
-          (goto-char (match-end 0))))
-      (insert block)
-      (write-region (point-min) (point-max) file nil 'silent))))
 
 ;; Metadata dispatch
 
 (defun zhihu--file-format (file)
-  "返回 FILE 对应的 `typst'、`markdown' 或 `org'；其它返回 nil。"
+  "返回 FILE 对应的 `typst' 或 `markdown'；其它返回 nil。"
   (pcase (downcase (or (file-name-extension file) ""))
     ("typ" 'typst)
     ((or "md" "markdown") 'markdown)
-    ("org" 'org)
     (_ nil)))
 
 (defun zhihu--read-source-meta (file)
@@ -2299,15 +2119,13 @@ question-id、article-id 与 thought-id 必须且只能出现一个，分别表�
         nil
         (plist-get source-meta :banner)
         (plist-get source-meta :toc))))
-    (markdown (zhihu--md-read-meta file))
-    (org (zhihu--org-read-meta file))))
+    (markdown (zhihu--md-read-meta file))))
 
 (defun zhihu--write-zhihu-meta (file meta)
   "把 META 中的知乎渠道状态写回 FILE。"
   (cl-ecase (zhihu--file-format file)
     (typst (zhihu--typst-write-native-metadata file meta))
-    (markdown (zhihu--md-write-zhihu-meta file meta))
-    (org (zhihu--org-write-zhihu-meta file meta))))
+    (markdown (zhihu--md-write-zhihu-meta file meta))))
 
 ;;;; HTML conversion
 
@@ -2752,16 +2570,12 @@ CANONICAL 非 nil 时要求 TEXT 已经是规范形式。"
 
 ;; Source formats
 ;;
-;; Pandoc 负责 Markdown/Org → HTML，也强制规范化 Typst HTML/MathML；
+;; Pandoc 负责 Markdown → HTML，也强制规范化 Typst HTML/MathML；
 ;; Typst CLI 负责先把 Typst 源稿编译成语义 HTML。
 ;; 转换都通过临时 buffer + call-process-region，避免 shell 转义。
 
 (defconst zhihu--pandoc-filter
-  "local function fail(message)
-  error('zhihu-card: ' .. message, 0)
-end
-
-local markdown_alerts = ZHIHU_MARKDOWN_ALERTS == true
+  "local markdown_alerts = ZHIHU_MARKDOWN_ALERTS == true
 
 local alert_types = {
   note = { icon = 'ℹ', title = 'Note' },
@@ -2864,134 +2678,6 @@ local function make_reference(note)
   return marker
 end
 
-local function org_card_marker(raw)
-  if raw.format ~= 'org' then
-    return nil
-  end
-
-  local body = raw.text:match(
-    '^%s*#%+[Aa][Tt][Tt][Rr]_[Zz][Hh][Ii][Hh][Uu]:%s*(.-)%s*$'
-  )
-  if body == nil then
-    return nil
-  end
-
-  local tokens = {}
-  for token in body:gmatch('%S+') do
-    tokens[#tokens + 1] = token
-  end
-
-  local values = {}
-  for i, token in ipairs(tokens) do
-    if token:lower() == ':type' then
-      local value = tokens[i + 1]
-      if value == nil or value:sub(1, 1) == ':' then
-        fail('Org 的 :type 缺少值（卡片链接应写成 :type link-card）')
-      end
-      values[#values + 1] = value:lower()
-    end
-  end
-
-  if #values == 0 then
-    return nil
-  elseif #values > 1 then
-    fail('同一条 ATTR_ZHIHU 中重复指定了 :type')
-  elseif values[1] == 'link-card' then
-    return true
-  end
-  return nil
-end
-
-local function typst_marker(link)
-  local short = link.attributes['zhihu-card'] ~= nil
-  local full = link.attributes['data-zhihu-card'] ~= nil
-  if short and full then
-    fail('同一链接重复指定了 data-zhihu-card')
-  end
-  return short or full
-end
-
-local function marker_kind(link)
-  local typst = typst_marker(link)
-  local markdown = link.title == 'card'
-  if typst and markdown then
-    fail('同一链接同时使用了 data-zhihu-card 和 title=card')
-  elseif typst then
-    return 'Typst'
-  elseif markdown then
-    return 'Markdown'
-  end
-end
-
-local function single_link(block)
-  if (block.t == 'Para' or block.t == 'Plain')
-      and #block.content == 1
-      and block.content[1].t == 'Link' then
-    return block.content[1]
-  end
-end
-
-local function validate_link(link)
-  local target = link.target
-  if not web_url(target) then
-    fail('卡片链接必须使用包含 host 的 http:// 或 https:// URL')
-  end
-
-  local title = normalize_space(pandoc.utils.stringify(link.content))
-  if title == '' then
-    fail('卡片链接标题不能为空')
-  elseif title:find('%c') then
-    fail('卡片链接标题不能包含控制字符')
-  end
-
-  local has_note = false
-  link:walk({
-    Note = function()
-      has_note = true
-    end,
-  })
-  if has_note then
-    fail('卡片链接标题不能包含脚注')
-  end
-
-  if link.identifier ~= '' or #link.classes > 0 then
-    fail('卡片链接不能附带 id 或 class')
-  end
-  for key, _ in pairs(link.attributes) do
-    if key ~= 'zhihu-card' and key ~= 'data-zhihu-card' then
-      fail('卡片链接包含不支持的属性 ' .. key)
-    end
-  end
-
-  return title
-end
-
-local function make_card(link)
-  local title = validate_link(link)
-  local result = pandoc.Link(link.content, link.target)
-  result.attributes['data-draft-node'] = 'block'
-  result.attributes['data-draft-type'] = 'link-card'
-  result.attributes['data-draft-title'] = title
-  result.attributes['data-draft-cover'] = ''
-  return pandoc.Plain({result})
-end
-
-local function reject_nested_markers(block)
-  block:walk({
-    RawBlock = function(raw)
-      if org_card_marker(raw) then
-        fail('Org 卡片标记必须位于文档顶层并紧跟独立链接段落')
-      end
-    end,
-    Link = function(link)
-      local kind = marker_kind(link)
-      if kind ~= nil then
-        fail(kind .. ' 卡片链接必须是文档顶层的独立链接段落')
-      end
-    end,
-  })
-end
-
 local function alert_title_block(alert)
   return pandoc.Para({
     pandoc.Strong({
@@ -3034,47 +2720,8 @@ local function make_modern_alert(div)
 end
 
 function Pandoc(doc)
-  if not FORMAT:match('^html') then
-    fail('卡片链接 filter 只能生成 HTML')
-  end
-
   reference_numbers = {}
   next_reference_number = 0
-
-  local output = pandoc.List()
-  local i = 1
-  while i <= #doc.blocks do
-    local block = doc.blocks[i]
-    local org_marker =
-      block.t == 'RawBlock' and org_card_marker(block) or nil
-
-    if org_marker then
-      local following = doc.blocks[i + 1]
-      local link = following and single_link(following) or nil
-      if link == nil then
-        fail(
-          'Org 的 ATTR_ZHIHU :type link-card '
-            .. '后必须紧跟仅含一个链接的段落'
-        )
-      elseif marker_kind(link) ~= nil then
-        fail('Org 卡片链接不能再使用其他卡片标记')
-      end
-      output:insert(make_card(link))
-      i = i + 2
-    else
-      local link = single_link(block)
-      local kind = link and marker_kind(link) or nil
-      if kind ~= nil then
-        output:insert(make_card(link))
-      else
-        reject_nested_markers(block)
-        output:insert(block)
-      end
-      i = i + 1
-    end
-  end
-
-  doc.blocks = output
   local transforms = {
     Note = make_reference,
   }
@@ -3084,7 +2731,76 @@ function Pandoc(doc)
   return doc:walk(transforms)
 end
 "
-  "Pandoc 中把卡片、脚注和 Markdown Alert 转成知乎原生节点的 Lua filter。")
+  "Pandoc 中把脚注和 Markdown Alert 转成知乎原生节点的 Lua filter。")
+
+(defun zhihu--h-cite-node-p (node)
+  "NODE 是否是 Microformats2 `h-cite' 根节点。"
+  (and (consp node) (zhihu--node-has-class-p node "h-cite")))
+
+(defun zhihu--h-cite-property-nodes (node property)
+  "返回 NODE 内具有 Microformats2 PROPERTY class 的元素。"
+  (dom-search
+   node
+   (lambda (child)
+     (and
+      (consp child)
+      (zhihu--node-has-class-p child property)))))
+
+(defun zhihu--single-h-cite-child (node)
+  "返回 NODE 唯一的 `h-cite' 子节点，否则返回 nil。"
+  (pcase (zhihu--dom-significant-children node)
+    (`(,child)
+     (and (zhihu--h-cite-node-p child) child))))
+
+(defun zhihu--validate-h-cite-placement (body)
+  "确保 BODY 中的 `h-cite' 只作为顶层独立内容出现。"
+  (let (allowed)
+    (dolist (child (zhihu--dom-significant-children body))
+      (cond
+       ((zhihu--h-cite-node-p child)
+        (push child allowed))
+       ((and (consp child) (eq (dom-tag child) 'p))
+        (when-let* ((cite (zhihu--single-h-cite-child child)))
+          (push cite allowed)))))
+    (dolist (node (dom-search body #'zhihu--h-cite-node-p))
+      (unless (memq node allowed)
+        (error "zhihu: h-cite 卡片必须是文档顶层的独立内容")))))
+
+(defun zhihu--h-cite-data (node)
+  "严格读取 Microformats2 `h-cite' NODE 的 URL 与标题。"
+  (let ((url-nodes (zhihu--h-cite-property-nodes node "u-url"))
+        (name-nodes (zhihu--h-cite-property-nodes node "p-name")))
+    (unless (= (length url-nodes) 1)
+      (error "zhihu: h-cite 卡片必须只包含一个 u-url"))
+    (unless (= (length name-nodes) 1)
+      (error "zhihu: h-cite 卡片必须只包含一个 p-name"))
+    (let* ((url-node (car url-nodes))
+           (name-node (car name-nodes))
+           (url
+            (and (eq (dom-tag url-node) 'a)
+                 (dom-attr url-node 'href)))
+           (title
+            (string-trim
+             (replace-regexp-in-string
+              "[[:space:]]+" " " (dom-inner-text name-node)))))
+      (unless (zhihu--web-url-p url)
+        (error
+         "zhihu: h-cite 的 u-url 必须是含 host 的 HTTP(S) 链接"))
+      (when (string-empty-p title)
+        (error "zhihu: h-cite 的 p-name 不能为空"))
+      (list :url url :title title))))
+
+(defun zhihu--native-link-card-node (node)
+  "把 Microformats2 `h-cite' NODE 转成知乎原生 link-card。"
+  (let* ((data (zhihu--h-cite-data node))
+         (url (plist-get data :url))
+         (title (plist-get data :title)))
+    `(a ((href . ,url)
+         (data-draft-node . "block")
+         (data-draft-type . "link-card")
+         (data-draft-title . ,title)
+         (data-draft-cover . ""))
+        ,title)))
 
 (defun zhihu--math-span-p (node)
   "NODE 是否是 pandoc 输出的 math span。"
@@ -3154,35 +2870,6 @@ end
                  unless (member cls '("sourceCode" "code")) return cls)
         "")))
 
-(defun zhihu--checkbox-input-p (node)
-  "NODE 是否是 HTML checkbox input。"
-  (and (consp node)
-       (eq (dom-tag node) 'input)
-       (equal (downcase (or (dom-attr node 'type) "")) "checkbox")))
-
-(defun zhihu--task-list-label-p (node)
-  "NODE 是否是包裹 checkbox 的 task list label。"
-  (and (consp node)
-       (eq (dom-tag node) 'label)
-       (cl-find-if #'zhihu--checkbox-input-p
-                   (dom-by-tag node 'input))))
-
-(defun zhihu--without-task-list-classes (attrs)
-  "从 ATTRS 的 class 中移除 Pandoc task list 专用 class。"
-  (let* ((attrs (copy-tree attrs))
-         (class-cell (assq 'class attrs))
-         (classes
-          (and class-cell
-               (cl-remove-if
-                (lambda (class)
-                  (member class '("task-list" "task-list-item")))
-                (split-string (cdr class-cell) "[ \t\n]+" t)))))
-    (when class-cell
-      (if classes
-          (setcdr class-cell (string-join classes " "))
-        (setq attrs (delq class-cell attrs))))
-    attrs))
-
 (defun zhihu--captioned-figure-parts (node)
   "若 NODE 是单图图注 figure，返回 (IMAGE . FIGCAPTION)，否则返回 nil。
 只识别忽略空白后恰好含一个直接 `img' 和一个直接 `figcaption' 的结构。"
@@ -3250,6 +2937,13 @@ STANDALONE-IMAGE 非 nil 表示 NODE 是独占段落或带图注的普通图片�
       (if (stringp alt) alt "")))
    ((zhihu--reference-marker-p node)
     (zhihu--native-reference-node node))
+   ((zhihu--h-cite-node-p node)
+    (zhihu--native-link-card-node node))
+   ((and
+     (eq (dom-tag node) 'p)
+     (zhihu--single-h-cite-child node))
+    (zhihu--native-link-card-node
+     (zhihu--single-h-cite-child node)))
    ((zhihu--math-span-p node)
     (let* ((display (zhihu--node-has-class-p node "display"))
            (tex (zhihu--math-span-tex node)))
@@ -3264,11 +2958,6 @@ STANDALONE-IMAGE 非 nil 表示 NODE 是独占段落或带图注的普通图片�
       (if code
           `(pre ((lang . ,(zhihu--code-language node code))) ,(dom-inner-text code))
         `(pre ((lang . ,(or (dom-attr node 'lang) ""))) ,(dom-inner-text node)))))
-   ((zhihu--checkbox-input-p node)
-    (if (assq 'checked (dom-attributes node)) "☑ " "☐ "))
-   ((zhihu--task-list-label-p node)
-    `(span nil
-           ,@(mapcar #'zhihu--zhihuify-node (dom-children node))))
    ((and (eq (dom-tag node) 'a)
          (let ((title (dom-attr node 'title)))
            (and (stringp title)
@@ -3302,10 +2991,9 @@ STANDALONE-IMAGE 非 nil 表示 NODE 是独占段落或带图注的普通图片�
              (car significant)))
            ;; 知乎会过滤 style；保留语义/data 属性，class 仅在普通节点保留。
            (attrs
-            (zhihu--without-task-list-classes
-             (cl-remove-if
-              (lambda (a) (eq (car a) 'style))
-              (copy-tree (cadr node)))))
+            (cl-remove-if
+             (lambda (a) (eq (car a) 'style))
+             (copy-tree (cadr node))))
            (children
             (mapcar
              (lambda (child)
@@ -3325,6 +3013,7 @@ STANDALONE-IMAGE 非 nil 表示 NODE 是独占段落或带图注的普通图片�
          (body (car (dom-by-tag dom 'body)))
          (new-body `(body nil ,@(mapcar #'zhihu--zhihuify-node
                                         (dom-children body)))))
+    (zhihu--validate-h-cite-placement body)
     (zhihu--inner-html new-body)))
 
 (defun zhihu--png-bytes-p (bytes)
@@ -3338,8 +3027,7 @@ STANDALONE-IMAGE 非 nil 表示 NODE 是独占段落或带图注的普通图片�
 
 (defun zhihu--render-mermaid-png (source)
   "用 Mermaid CLI 把 SOURCE 渲染为 PNG 字节。
-只有 Markdown 或 Org 中实际出现 Mermaid code block 时才要求 PATH 中存在
-`mmdc'。"
+只有 Markdown 中实际出现 Mermaid code block 时才要求 PATH 中存在 `mmdc'。"
   (when (string-empty-p (string-trim source))
     (error "zhihu: Mermaid code block 不能为空"))
   (unless (executable-find "mmdc")
@@ -3434,10 +3122,6 @@ SHIFT-HEADINGS 非 nil 时把正文标题整体下移一级，为页面标题保
     "gfm+alerts+yaml_metadata_block+implicit_figures+attributes" md
     zhihu-enable-markdown-heading-level-shift)))
 
-(defun zhihu--org->html (org-text)
-  "ORG-TEXT → 知乎方言 HTML。"
-  (zhihu--render-mermaid-blocks
-   (zhihu--pandoc-to-zhihu-html "org" org-text t)))
 
 ;; Source conversion entry points
 
@@ -3478,7 +3162,7 @@ SHIFT-HEADINGS 非 nil 时把正文标题整体下移一级，为页面标题保
     (unless (string-empty-p title) title)))
 
 (defun zhihu--source-to-html (file)
-  "把 Typst、Markdown 或 Org FILE 转为知乎 HTML。"
+  "把 Typst 或 Markdown FILE 转为知乎 HTML。"
   (pcase (zhihu--file-format file)
     ('typst
      (let ((full (zhihu--typst-compile-html file)))
@@ -3488,18 +3172,13 @@ SHIFT-HEADINGS 非 nil 时把正文标题整体下移一级，为页面标题保
       (with-temp-buffer
         (insert-file-contents file)
         (buffer-string))))
-    ('org
-     (zhihu--org->html
-      (with-temp-buffer
-        (insert-file-contents file)
-        (buffer-string))))
     (_ (error "zhihu: 不支持的文件类型 %s" file))))
 
 (defun zhihu--compile-source-document
     (file metadata-title &optional title-function)
   "把 FILE 编译成统一的知乎 HTML 文档表示。
-返回 `(:format FORMAT :title TITLE :html HTML)'。Markdown 和 Org 的标题
-来自已经解析的 METADATA-TITLE；Typst 的标题和正文来自同一次 HTML 编译。
+返回 `(:format FORMAT :title TITLE :html HTML)'。Markdown 的标题来自已经
+解析的 METADATA-TITLE；Typst 的标题和正文来自同一次 HTML 编译。
 非 nil 的 TITLE-FUNCTION 会在正文转换前接收标题，其返回值成为 TITLE。"
   (let ((format
          (or (zhihu--file-format file)
@@ -3637,11 +3316,6 @@ SHIFT-HEADINGS 非 nil 时把正文标题整体下移一级，为页面标题保
              text (string-replace "[" "\\[" text)
              text (string-replace "]" "\\]" text))
        (format "[%s](%s %S)" text profile-url marker))
-      (org
-       (format "@@html:<a href=\"%s\" title=\"%s\">%s</a>@@"
-               profile-url marker
-               (string-replace
-                "@" "&#64;" (xml-escape-string text))))
       (typst
        (format
         "#html.elem(\"a\", attrs: (href: %S, title: %S), text(%S))"
@@ -3902,45 +3576,8 @@ COMMENT-P 表示 VALUE-LIMIT 后紧跟注释。"
                       (list :format 'markdown)
                       bounds))))))))))
 
-(defconst zhihu--org-editing-block-types
-  '(center-block comment-block drawer dynamic-block example-block
-                 export-block property-drawer quote-block special-block
-                 src-block verse-block)
-  "不能包含文档级知乎编辑 metadata 的 Org 元素类型。")
 
-(defun zhihu--org-editing-blocked-node-p (node)
-  "NODE 位于非文档级 Org 容器中时返回非 nil。"
-  (let (blocked)
-    (while node
-      (when (memq (org-element-type node)
-                  zhihu--org-editing-block-types)
-        (setq blocked t))
-      (setq node (org-element-property :parent node)))
-    blocked))
 
-(defun zhihu--org-column-id-context ()
-  "返回光标所在 Org `ZHIHU_COLUMN_ID' 值槽的补全上下文。"
-  (when (and buffer-file-name
-             (eq (zhihu--file-format buffer-file-name) 'org)
-             (derived-mode-p 'org-mode))
-    (require 'org-element)
-    (let* ((origin (point))
-           (line-start (line-beginning-position))
-           (line-end (line-end-position))
-           (node (org-element-context)))
-      (when (and (eq (org-element-type node) 'keyword)
-                 (equal (org-element-property :key node)
-                        "ZHIHU_COLUMN_ID")
-                 (not (zhihu--org-editing-blocked-node-p node)))
-        (save-excursion
-          (goto-char line-start)
-          (let ((case-fold-search t))
-            (when (looking-at
-                   "^#\\+ZHIHU_COLUMN_ID[ \t]*:")
-              (when-let* ((bounds
-                          (zhihu--scalar-completion-context
-                           (match-end 0) line-end origin)))
-                (append (list :format 'org) bounds)))))))))
 
 (defun zhihu--typst-metadata-dictionary-info (region)
   "返回 canonical Typst metadata REGION 的 dictionary 信息。
@@ -4050,7 +3687,6 @@ COMMENT-P 表示 VALUE-LIMIT 后紧跟注释。"
   (pcase (and buffer-file-name
               (zhihu--file-format buffer-file-name))
     ('markdown (zhihu--markdown-column-id-context))
-    ('org (zhihu--org-column-id-context))
     ('typst (zhihu--typst-column-id-context))))
 
 (defun zhihu--topic-kind-and-limit (identities)
@@ -4257,41 +3893,7 @@ COMMENT-P 表示 VALUE-LIMIT 后紧跟注释。"
                   block-start block-end indentation)
                  origin kind-limit)))))))))
 
-(defun zhihu--org-topic-kind-and-limit ()
-  "按当前 Org buffer 的文档级 identity 返回话题类型和上限。"
-  (require 'org-element)
-  (let (identities)
-    (org-element-map
-     (org-element-parse-buffer) 'keyword
-     (lambda (node)
-       (unless (zhihu--org-editing-blocked-node-p node)
-         (pcase (org-element-property :key node)
-           ("ZHIHU_QUESTION_ID" (push :question-id identities))
-           ("ZHIHU_ARTICLE_ID" (push :article-id identities))
-           ("ZHIHU_THOUGHT_ID" (push :thought-id identities))))))
-    (zhihu--topic-kind-and-limit (nreverse identities))))
 
-(defun zhihu--org-topic-context ()
-  "返回当前 Org `ZHIHU_TOPICS' JSON item 的补全上下文。"
-  (when (and buffer-file-name
-             (eq (zhihu--file-format buffer-file-name) 'org)
-             (derived-mode-p 'org-mode))
-    (require 'org-element)
-    (let* ((origin (point))
-           (node (org-element-context)))
-      (when (and (eq (org-element-type node) 'keyword)
-                 (equal (org-element-property :key node) "ZHIHU_TOPICS")
-                 (not (zhihu--org-editing-blocked-node-p node)))
-        (save-excursion
-          (goto-char (line-beginning-position))
-          (let ((case-fold-search t))
-            (when (looking-at "^#\\+ZHIHU_TOPICS[ \t]*:")
-              (let ((items
-                     (zhihu--quoted-sequence-items
-                      (match-end 0) (line-end-position) ?\[ ?\])))
-                (zhihu--topic-context-from-items
-                 'org items origin
-                 (zhihu--org-topic-kind-and-limit))))))))))
 
 (defun zhihu--typst-direct-metadata-fields (dictionary)
   "返回 Typst DICTIONARY 中直接出现的已知 metadata 字段。
@@ -4638,7 +4240,6 @@ inline mapping，以及缩进层级不一致的位置均不触发字段名补全
   (pcase (and buffer-file-name
               (zhihu--file-format buffer-file-name))
     ('markdown (zhihu--markdown-topic-context))
-    ('org (zhihu--org-topic-context))
     ('typst (zhihu--typst-topic-context))))
 
 (defun zhihu--completion-session-remember (session entries)
@@ -4713,7 +4314,6 @@ inline mapping，以及缩进层级不一致的位置均不触发字段名补全
      (pcase format
        ('markdown
         (concat " " (json-encode-string id)))
-       ('org (concat " " id))
        ('typst (concat " " (format "%S" id)))
        (_ (error "zhihu: 不支持的补全源稿格式 %S"
                  format)))
@@ -5121,8 +4721,8 @@ CODE-RANGES 是预先收集并排序的代码区间。"
   "把 RECORD 的话题名转为 FORMAT 字符串内容；_SUFFIX 被忽略。"
   (let* ((name (plist-get record :name))
          (quoted
-          (pcase format
-            ((or 'markdown 'org) (json-encode-string name))
+         (pcase format
+            ('markdown (json-encode-string name))
             ('typst (format "%S" name))
             (_ (error "zhihu: 不支持的话题补全源稿格式 %S"
                       format)))))
@@ -5238,8 +4838,6 @@ CODE-RANGES 是预先收集并排序的代码区间。"
       ('markdown
        (and (derived-mode-p 'markdown-mode)
             'markdown))
-      ('org
-       (and (derived-mode-p 'org-mode) 'org))
       ('typst
        (and (derived-mode-p 'typst-ts-mode 'typst-mode)
             'typst)))))
@@ -5265,7 +4863,7 @@ CODE-RANGES 是预先收集并排序的代码区间。"
 
 ;;;###autoload
 (define-minor-mode zhihu-mode
-  "在当前 Markdown、Org 或 Typst 知乎源稿中启用编辑辅助。
+  "在当前 Markdown 或 Typst 知乎源稿中启用编辑辅助。
 本 mode 提供 metadata 字段名、`column-id' 和 `topics' 补全；Markdown 还支持
 正文 `@QUERY' 用户补全。发布仍由 `zhihu-publish' 显式执行。"
   :init-value nil
@@ -5277,7 +4875,7 @@ CODE-RANGES 是预先收集并排序的代码区间。"
         (setq zhihu-mode nil)
         (zhihu--disable-editing-support)
         (user-error
-         "zhihu: 当前 buffer 不是对应主模式的 Markdown、Org 或 Typst 源稿"))
+         "zhihu: 当前 buffer 不是对应主模式的 Markdown 或 Typst 源稿"))
     (zhihu--disable-editing-support))
   (when zhihu-mode
     (zhihu--reset-completion-caches)
@@ -6925,9 +6523,7 @@ PIN-ID 非 nil 时更新已有想法。CONTENT 是
       (user-error "zhihu: 新建源稿不支持远程路径"))
     (unless (and format (not (file-directory-p file)))
       (user-error
-       (concat
-        "zhihu: 源稿目标必须是使用 .typ、.md、.markdown"
-        " 或 .org 扩展名的文件路径：%s")
+       "zhihu: 源稿目标必须是使用 .typ、.md 或 .markdown 扩展名的文件路径：%s"
        file))
     (when (or (string-empty-p stem)
               (member stem '("." ".."))
@@ -6964,16 +6560,7 @@ PIN-ID 非 nil 时更新已有想法。CONTENT 是
         (when toc
           "toc: true\n")
         (zhihu--format-zhihu-yaml meta)
-        "---\n\n"))
-      (org
-       (concat
-        (format "#+TITLE: %s\n" title)
-        (when banner
-          (format "#+BANNER: %s\n" banner))
-        (when toc
-          "#+TOC: headlines 2\n")
-        (zhihu--format-org-zhihu-metadata meta)
-        "\n")))))
+        "---\n\n")))))
 
 (defun zhihu--create-source-file (file meta)
   "按 META 创建 FILE；目标路径已被占用时拒绝覆盖。"
@@ -7006,7 +6593,7 @@ PIN-ID 非 nil 时更新已有想法。CONTENT 是
 对应问题的标题会成为初始文档标题；创建后显式启用 `zhihu-mode'。"
   (interactive
    (list (read-string "知乎问题 ID 或 URL: ")
-         (read-file-name "源稿文件（.typ/.md/.markdown/.org）: "
+         (read-file-name "源稿文件（.typ/.md/.markdown）: "
                          default-directory nil nil)))
   (let ((meta
          (zhihu--zhihu-meta-from-plist
