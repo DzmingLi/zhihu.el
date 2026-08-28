@@ -144,16 +144,6 @@
     (apply #'zhihu--publish-article
            article-id is-published options)))
 
-(defun zhihu-test--publish-pin-body
-    (thought-id title content topics &rest options)
-  "Return the body `zhihu--publish-pin' passes to the request layer."
-  (cl-letf (((symbol-function 'zhihu--publish-request)
-             (lambda (body &rest request-options)
-               (should-not request-options)
-               body)))
-    (apply #'zhihu--publish-pin
-           thought-id title content topics options)))
-
 (defun zhihu-test--hex (bytes)
   "Return a lowercase hexadecimal representation of BYTES."
   (mapconcat (lambda (byte) (format "%02x" byte)) bytes ""))
@@ -290,197 +280,6 @@
     (should
      (equal (cdr (assoc-string "Cookie" sent-headers t))
             "d_c0=token; z_c0=session"))))
-
-(ert-deftest zhihu-markdown-fenced-code-preserves-language ()
-  (skip-unless (executable-find "pandoc"))
-  (let ((html (zhihu--md->html
-               "```python\nprint(\"hello\")\n```\n")))
-    (should (string-match-p
-             (regexp-quote "<pre lang=\"python\">")
-             html))))
-
-(ert-deftest zhihu-markdown-github-alerts-degrade-to-blockquotes ()
-  (skip-unless (executable-find "pandoc"))
-  (let* ((html
-          (zhihu--md->html
-           (mapconcat
-            (lambda (type)
-              (format "> [!%s]\n> %s body.\n" type type))
-            '("NOTE" "TIP" "IMPORTANT" "WARNING" "CAUTION")
-            "\n")))
-         (dom
-          (zhihu--parse-html
-           (concat "<html><body>" html "</body></html>")))
-         (quotes (dom-by-tag dom 'blockquote)))
-    (should (= (length quotes) 5))
-    (should
-     (equal
-      (mapcar
-       (lambda (quote)
-         (dom-inner-text (car (dom-by-tag quote 'strong))))
-       quotes)
-      '("ℹ Note" "💡 Tip" "❗ Important" "⚠ Warning" "⛔ Caution")))
-    (should
-     (equal
-      (mapcar
-       (lambda (quote)
-         (dom-inner-text (car (last (dom-by-tag quote 'p)))))
-       quotes)
-      '("NOTE body." "TIP body." "IMPORTANT body."
-        "WARNING body." "CAUTION body.")))))
-
-(ert-deftest zhihu-markdown-github-alert-preserves-structured-body ()
-  (skip-unless (executable-find "pandoc"))
-  (let* ((html
-          (zhihu--md->html
-           (concat
-            "> [!WARNING]\n"
-            "> First **bold** paragraph.\n"
-            ">\n"
-            "> Second [linked](https://example.com) paragraph.\n"
-            ">\n"
-            "> - one\n"
-            "> - two\n"
-            ">\n"
-            "> ```sh\n"
-            "> echo hi\n"
-            "> ```\n")))
-         (dom
-          (zhihu--parse-html
-           (concat "<html><body>" html "</body></html>")))
-         (quote (car (dom-by-tag dom 'blockquote)))
-         (paragraphs (dom-by-tag quote 'p))
-         (items (dom-by-tag quote 'li))
-         (pre (car (dom-by-tag quote 'pre))))
-    (should quote)
-    (should (equal (dom-inner-text (car paragraphs)) "⚠ Warning"))
-    (should
-     (equal
-      (zhihu--outer-html (nth 1 paragraphs))
-      "<p>First <strong>bold</strong> paragraph.</p>"))
-    (should (= (length (dom-by-tag (nth 1 paragraphs) 'strong)) 1))
-    (should (equal (dom-attr (car (dom-by-tag quote 'a)) 'href)
-                   "https://example.com"))
-    (should (equal (mapcar #'dom-inner-text items) '("one" "two")))
-    (should (equal (dom-attr pre 'lang) "sh"))
-    (should (equal (dom-inner-text pre) "echo hi"))))
-
-(ert-deftest zhihu-github-alert-conversion-is-markdown-ast-only ()
-  (skip-unless (executable-find "pandoc"))
-  (let* ((raw-html
-          (zhihu--md->html
-           (concat
-            "<div class=\"warning\">"
-            "<div class=\"title\"><p>Warning</p></div>"
-            "<p>Raw HTML body.</p>"
-            "</div>\n")))
-         (raw-dom
-          (zhihu--parse-html
-           (concat "<html><body>" raw-html "</body></html>"))))
-    (should-not (dom-by-tag raw-dom 'blockquote))
-    (should
-     (cl-find-if
-      (lambda (node) (zhihu--node-has-class-p node "warning"))
-      (dom-by-tag raw-dom 'div)))))
-
-(ert-deftest zhihu-markdown-mermaid-fences-render-png-images ()
-  (skip-unless (executable-find "pandoc"))
-  (let (sources)
-    (cl-letf
-        (((symbol-function 'zhihu--render-mermaid-png)
-          (lambda (source)
-            (push source sources)
-            zhihu-test--mermaid-png)))
-      (let* ((html
-              (zhihu--md->html
-               (concat
-                "````mermaid\n"
-                "flowchart LR\n"
-                "  A --> B\n"
-                "````\n\n"
-                "~~~mermaid\n"
-                "sequenceDiagram\n"
-                "  A->>B: hello\n"
-                "~~~\n")))
-             (dom
-              (zhihu--parse-html
-               (concat "<html><body>" html "</body></html>")))
-             (images (dom-by-tag dom 'img)))
-        (should
-         (equal
-          (nreverse sources)
-          '("flowchart LR\n  A --> B"
-            "sequenceDiagram\n  A->>B: hello")))
-        (should (= (length images) 2))
-        (should-not (dom-by-tag dom 'pre))
-        (dolist (image images)
-          (should (equal (dom-attr image 'alt) "Mermaid diagram"))
-          (let ((decoded
-                 (zhihu--decode-data-url (dom-attr image 'src))))
-            (should (equal (car decoded) "image/png"))
-            (should (equal (cdr decoded)
-                           zhihu-test--mermaid-png))))))))
-
-(ert-deftest zhihu-mermaid-rendering-is-language-specific ()
-  (skip-unless (executable-find "pandoc"))
-  (cl-letf
-      (((symbol-function 'zhihu--render-mermaid-png)
-        (lambda (&rest _args)
-          (ert-fail "This code block must not be rendered as Mermaid"))))
-    (should
-     (string-match-p
-      (regexp-quote "<pre lang=\"mermaid-js\">")
-      (zhihu--md->html
-       "```mermaid-js\nflowchart LR\n  A --> B\n```\n")))))
-
-(ert-deftest zhihu-source-figure-captions-use-native-image-annotations ()
-  (skip-unless (executable-find "pandoc"))
-  (let* ((markdown
-          (zhihu--md->html
-           (concat
-            "![图 1：独占段落图片](block.svg)\n\n"
-            "正文中的 ![替代文字](inline.svg) 图片。\n")))
-         (typst-html
-          (zhihu--normalize-html
-           (concat
-            "<figure data-size=\"small\">"
-            "<img src=\"typst.svg\" alt=\"替代文字\">"
-            "<figcaption>Figure&nbsp;1: <strong>Typst 图</strong></figcaption>"
-            "</figure>"))))
-    (dolist
-        (case
-         `((,markdown
-            ("图 1：独占段落图片")
-            ("block.svg"))
-           (,typst-html
-            ("Figure 1: Typst 图")
-            ("typst.svg"))))
-      (pcase-let* ((`(,html ,captions ,sources) case)
-                   (dom
-                    (zhihu--parse-html
-                     (concat "<html><body>" html "</body></html>")))
-                   (images (dom-by-tag dom 'img)))
-        (should-not (dom-by-tag dom 'figure))
-        (should-not (dom-by-tag dom 'figcaption))
-        (should (equal (mapcar (lambda (img) (dom-attr img 'src)) images)
-                       sources))
-        (should
-         (equal
-          (mapcar (lambda (img) (dom-attr img 'data-caption)) images)
-          captions))))
-    (let* ((dom
-            (zhihu--parse-html
-             (concat "<html><body>" typst-html "</body></html>")))
-           (image (car (dom-by-tag dom 'img))))
-      (should (equal (dom-attr image 'data-size) "small"))
-      (should (equal (dom-attr image 'alt) "替代文字")))
-    (let* ((dom
-            (zhihu--parse-html
-             (concat "<html><body>" markdown "</body></html>"))))
-      (should
-       (string-match-p
-        (regexp-quote "正文中的 替代文字 图片。")
-        (dom-inner-text (car (dom-by-tag dom 'body))))))))
 
 (ert-deftest zhihu-native-caption-normalization-is-strict-and-plain-text ()
   (let* ((html
@@ -699,40 +498,6 @@
     (should invalid-directory)
     (should-not (file-exists-p invalid-directory))))
 
-(ert-deftest zhihu-markdown-pandoc-consumes-yaml-frontmatter ()
-  (skip-unless (executable-find "pandoc"))
-  (let ((html
-         (zhihu--md->html
-          (concat
-           "---\n"
-           "title: \"Metadata title\"\n"
-           "zhihu:\n"
-           "  question-id: \"123\"\n"
-           "---\n"
-           "# Visible heading\n"
-           "## Nested heading\n"))))
-    (should (string-match-p
-             "<h2\\(?: [^>]*\\)?>Visible heading</h2>"
-             html))
-    (should (string-match-p
-             "<h3\\(?: [^>]*\\)?>Nested heading</h3>"
-             html))
-    (should-not (string-match-p "Metadata title\\|question-id\\|zhihu:" html))))
-
-(ert-deftest zhihu-markdown-heading-shift-can-be-disabled ()
-  (skip-unless (executable-find "pandoc"))
-  (let* ((zhihu-enable-markdown-heading-level-shift nil)
-         (html
-          (zhihu--md->html
-           "---\ntitle: Metadata title\n---\n# Top level\n## Nested level\n")))
-    (should (string-match-p
-             "<h1\\(?: [^>]*\\)?>Top level</h1>"
-             html))
-    (should (string-match-p
-             "<h2\\(?: [^>]*\\)?>Nested level</h2>"
-             html))
-    (should-not (string-match-p "Metadata title" html))))
-
 (ert-deftest zhihu-html-normalization-preserves-heading-levels ()
   (skip-unless (executable-find "pandoc"))
   (let ((html
@@ -894,49 +659,6 @@
         '(:format typst :title "Typst title" :html "<p>Body</p>"))))
     (should (= compile-count 1))))
 
-(ert-deftest zhihu-compile-source-document-keeps-parsed-markdown-title ()
-  (cl-letf (((symbol-function 'zhihu--source-to-html)
-             (lambda (file)
-               (should (equal file "/tmp/post.md"))
-               "<p>Body</p>")))
-    (should
-     (equal
-      (zhihu--compile-source-document "/tmp/post.md" "Metadata title")
-      '(:format markdown :title "Metadata title" :html "<p>Body</p>")))))
-
-(ert-deftest zhihu-compile-source-document-validates-title-before-body ()
-  (dolist (file '("/tmp/post.md" "/tmp/post.typ"))
-    (let ((compiled 0)
-          (converted 0)
-          (messages 0))
-      (cl-letf
-          (((symbol-function 'zhihu--typst-compile-html)
-            (lambda (_file)
-              (cl-incf compiled)
-              "<html><head></head><body>Body</body></html>"))
-           ((symbol-function 'zhihu--html-document-title)
-            (lambda (_html) nil))
-           ((symbol-function 'zhihu--normalize-html)
-            (lambda (_html)
-              (cl-incf converted)
-              "<p>Body</p>"))
-           ((symbol-function 'zhihu--source-to-html)
-            (lambda (_file)
-              (cl-incf converted)
-              "<p>Body</p>"))
-           ((symbol-function 'message)
-            (lambda (&rest _args)
-              (cl-incf messages))))
-        (should-error
-         (zhihu--compile-source-document
-          file nil
-          (lambda (_title)
-            (user-error "Invalid title")))
-         :type 'user-error))
-      (should (= compiled (if (string-suffix-p ".typ" file) 1 0)))
-      (should (= messages (if (string-suffix-p ".typ" file) 1 0)))
-      (should (zerop converted)))))
-
 (ert-deftest zhihu-typst-divider-produces-hr ()
   (skip-unless (and (executable-find "typst")
                     (executable-find "pandoc")))
@@ -1029,34 +751,9 @@
            (zhihu--dom-nodes-with-attribute
             dom 'role "doc-bibliography"))))))))
 
-(ert-deftest zhihu-reference-conversion-rejects-lossy-input ()
-  (skip-unless (executable-find "pandoc"))
-  (should-error
-   (zhihu--md->html
-    (concat
-     "正文[^bad]。\n\n"
-     "[^bad]: [一](https://one.example) 与 [二](https://two.example)。\n")))
-  (should-error
-   (zhihu--md->html
-    "正文[^bad]。\n\n[^bad]: 第一段。\n\n    第二段。\n"))
-  (should-error
-   (zhihu--normalize-html
-    (concat
-     "<p>正文<sup role=\"doc-noteref\"><a href=\"#missing\">1</a></sup></p>"
-     "<section role=\"doc-endnotes\"><ol></ol></section>"))))
-
 (ert-deftest zhihu-typst-footnote-rewrite-is-a-no-op-without-footnotes ()
   (let ((html "<!DOCTYPE html><html><body><p>正文</p></body></html>"))
     (should (eq (zhihu--typst-rewrite-footnotes html) html))))
-
-(ert-deftest zhihu-h-cite-link-cards-work-from-markdown-and-html ()
-  (skip-unless (executable-find "pandoc"))
-  (let ((card (zhihu-test--h-cite-html
-               "https://example.com/a?x=1&amp;y=2" "Git Hub")))
-    (dolist (html (list (zhihu--md->html card)
-                        (zhihu--normalize-html card)))
-      (zhihu-test--link-card
-       html "https://example.com/a?x=1&y=2" "Git Hub"))))
 
 (ert-deftest zhihu-h-cite-requires-strict-top-level-properties ()
   (dolist
@@ -1068,134 +765,12 @@
         "<cite class=\"h-cite\"><a class=\"u-url\" href=\"https://example.com\"></a><span class=\"p-name\"></span></cite>"))
     (should-error (zhihu--zhihuify-html html))))
 
-(ert-deftest zhihu-card-title-is-an-ordinary-markdown-link ()
-  (skip-unless (executable-find "pandoc"))
-  (dolist (title '("card" "cardinal"))
-    (let ((html (zhihu--md->html
-                 (format "[GitHub](https://example.com %S)\n" title))))
-    (let ((anchor (zhihu-test--only-anchor html)))
-      (should (equal (dom-attr anchor 'href) "https://example.com"))
-      (should-not (dom-attr anchor 'data-draft-type))))))
-
-(ert-deftest zhihu-pandoc-filter-temp-file-is-always-removed ()
-  (let (filter)
-    (cl-letf (((symbol-function 'zhihu--shell-convert)
-               (lambda (program args _input)
-                 (should (equal program "pandoc"))
-                 (setq filter (cadr (member "--lua-filter" args)))
-                 (should (and filter (file-exists-p filter)))
-                 (error "conversion failed"))))
-      (should-error (zhihu--pandoc-to-zhihu-html "gfm" "Body" nil)))
-    (should filter)
-    (should-not (file-exists-p filter))))
-
 (ert-deftest zhihu-code-language-recognizes-pre-class ()
   (should
    (equal
     (zhihu--zhihuify-html
      "<pre class=\"python\"><code>x &amp; y</code></pre>")
     "<pre lang=\"python\">x &amp; y</pre>")))
-
-(ert-deftest zhihu-insert-user-mention-supports-source-formats ()
-  (let ((first-hash "0123456789abcdef0123456789abcdef")
-        (second-hash "fedcba9876543210fedcba9876543210")
-        (http-requests 0)
-        (selection-requests 0))
-    (cl-letf
-        (((symbol-function 'read-string)
-          (lambda (&rest _args) "zhang"))
-         ((symbol-function 'zhihu--http)
-          (lambda (method url &rest args)
-            (cl-incf http-requests)
-            (should (equal method "GET"))
-            (should
-             (equal
-              url
-              (concat
-               "https://www.zhihu.com/people/autocomplete"
-               "?token=zhang&max_matches=10&use_similar=0")))
-            ;; 该公开搜索接口不应读取或发送浏览器 Cookie。
-            (should-not args)
-            (list
-             :status 200
-             :body
-             (format
-              (concat
-               "[[\"entry\","
-               "[\"people\",\"张三\",\"zhang-san\","
-               "\"https://pic.example/first.jpg\",\"%s\","
-               "\"第一位用户\",[1],\"\"],"
-               "[\"people\",\"张三\",\"zhang-san-2\","
-               "\"https://pic.example/second.jpg\",\"%s\","
-               "\"第二位用户\",[2],\"\"]]]")
-              first-hash second-hash))))
-         ((symbol-function 'completing-read)
-          (lambda (_prompt collection &rest _args)
-            (cl-incf selection-requests)
-            (let ((labels
-                   (mapcar
-                    (lambda (candidate)
-                      (if (consp candidate) (car candidate) candidate))
-                    collection)))
-              (should (= (length labels) 2))
-              (should-not (equal (car labels) (cadr labels)))
-              (dolist
-                  (case
-                   `((,(car labels) "zhang-san" "第一位用户")
-                     (,(cadr labels) "zhang-san-2" "第二位用户")))
-                (dolist (fragment (cdr case))
-                  (should
-                   (string-match-p
-                    (regexp-quote fragment)
-                    (car case)))))
-              (cadr labels)))))
-      (dolist
-          (case
-           `((markdown
-              "/tmp/test.md"
-              ,(concat
-                "[@张三](https://www.zhihu.com/people/zhang-san-2 "
-                "\"member_mention_fedcba9876543210fedcba9876543210\")"))
-             (typst
-              "/tmp/test.typ"
-              ,(concat
-                "#html.elem(\"a\", attrs: "
-                "(href: \"https://www.zhihu.com/people/zhang-san-2\", "
-                "title: \"member_mention_"
-                "fedcba9876543210fedcba9876543210\"), "
-                "text(\"@张三\"))"))))
-        (with-temp-buffer
-          (setq buffer-file-name (nth 1 case))
-          (insert "前后")
-          (goto-char 2)
-          (call-interactively #'zhihu-insert-user-mention)
-          (should
-           (equal (buffer-string)
-                  (concat "前" (nth 2 case) "后")))
-          (let* ((source (buffer-string))
-                 (html
-                  (pcase (car case)
-                    ('markdown
-                     (when (executable-find "pandoc")
-                       (zhihu--md->html source)))
-                    ('typst
-                     (when (and (executable-find "typst")
-                                (executable-find "pandoc"))
-                       (zhihu-test--with-temp-file
-                        ".typ" source #'zhihu--source-to-html))))))
-            (when html
-              (let ((anchor (zhihu-test--only-anchor html)))
-                (should
-                 (equal (dom-attr anchor 'class) "member_mention"))
-                (should
-                 (equal
-                  (dom-attr anchor 'href)
-                  "/people/zhang-san-2"))
-                (should
-                 (equal (dom-attr anchor 'data-hash)
-                        second-hash)))))))
-      (should (= http-requests 2))
-      (should (= selection-requests 2)))))
 
 (ert-deftest zhihu-column-completion-labels-disambiguate-collisions ()
   (let* ((columns
@@ -1215,126 +790,11 @@
               entries)
       '("a" "b" "c")))))
 
-(ert-deftest zhihu-markdown-metadata-key-capf-inserts-key-with-colon ()
-  (with-temp-buffer
-    (setq buffer-file-name "/tmp/article.md")
-    (insert "---\nzhihu:\n  |\n---\n")
-    (goto-char (point-min))
-    (search-forward "|")
-    (delete-region (1- (point)) (point))
-    (let ((capf (zhihu-completion-at-point)))
-      (should capf)
-      (should (= (nth 0 capf) (nth 1 capf)))
-      (should
-       (equal
-        (all-completions "" (nth 2 capf))
-        '("question-id:" "article-id:" "thought-id:")))
-      (should (eq (plist-get (nthcdr 3 capf) :exclusive) t))))
-  (dolist
-      (case
-       '(("/tmp/article.md"
-          "---\nzhihu:\n  article-id:\n  col| # keep\n---\n"
-          "col" "column-id:" "  column-id: # keep")
-         ("/tmp/article.markdown"
-          "---\nzhihu:\n  column-id: writers\n  art|\n---\n"
-          "art" "article-id:" "  article-id:\n")
-         ("/tmp/quoted.md"
-          "---\n\"zhihu\" : # root\n  'article-id':\n  col|\n---\n"
-          "col" "column-id:" "  column-id:\n")
-         ("/tmp/crlf.md"
-          "---\r\nzhihu:\r\n  art|\r\n---\r\n"
-          "art" "article-id:" "  article-id:\r\n")))
-    (with-temp-buffer
-      (setq buffer-file-name (nth 0 case))
-      (insert (nth 1 case))
-      (goto-char (point-min))
-      (search-forward "|")
-      (delete-region (1- (point)) (point))
-      (let* ((capf (zhihu-completion-at-point))
-             (start (nth 0 capf))
-             (end (nth 1 capf))
-             (prefix (buffer-substring-no-properties start end))
-             (candidates (all-completions prefix (nth 2 capf))))
-        (should capf)
-        (should (equal prefix (nth 2 case)))
-        (should (equal candidates (list (nth 3 case))))
-        (should (eq (plist-get (nthcdr 3 capf) :exclusive) t))
-        (delete-region start end)
-        (goto-char start)
-        (insert (car candidates))
-        (should (string-match-p
-                 (regexp-quote (nth 4 case))
-                 (buffer-string)))))))
-
-(ert-deftest zhihu-markdown-metadata-key-context-respects-indentation ()
-  (dolist
-      (case
-       '(("---\nzhihu:\n    art|\n---\n" t)
-         ("---\nzhihu:\n    # gap\n\n    art|\n---\n" t)
-         ("---\nzhihu:\n    creation-statement: original\n  art|\n---\n"
-          nil)
-         ("---\nzhihu:\n  creation-statement: original\n    art|\n---\n"
-          nil)))
-    (with-temp-buffer
-      (setq buffer-file-name "/tmp/article.md")
-      (insert (car case))
-      (goto-char (point-min))
-      (search-forward "|")
-      (delete-region (1- (point)) (point))
-      (if (cadr case)
-          (progn
-            (should (zhihu--markdown-metadata-key-context))
-            (should (zhihu-completion-at-point)))
-        (should-not (zhihu--markdown-metadata-key-context))
-        (should-not (zhihu-completion-at-point))))))
-
-(ert-deftest zhihu-markdown-metadata-key-context-rejects-non-key-slots ()
-  (dolist
-      (source
-       '("---\nzhihu:\n  article-id:\n---\nart|\n"
-         "---\nzhihu:\n  art|\n"
-         "---\nzhihu: art|\n---\n"
-         "---\nzhihu:\n  nested:\n    art|\n---\n"
-         "---\nzhihu:\n  topics:\n    - art|\n---\n"
-         "---\nzhihu:\n  article-id: art|\n---\n"
-         "---\nzhihu:\n  # art|\n---\n"
-         "---\nzhihu:\n  art|:\n---\n"
-         "---\nzhihu:\n  art|_bad\n---\n"
-         "---\nzhihu:\n  \"art|\n---\n"
-         "---\nzhihu: {}\n  art|\n---\n"
-         "---\nzhihu: scalar\n  art|\n---\n"
-         "---\nZHIHU:\n  art|\n---\n"
-         "---\nzhihu:\n  question-id: 1\nzhihu:\n  art|\n---\n"
-         "---\nzhihu:\n  creation-statement: original\n  creation-statement: original\n  art|\n---\n"
-         "---\nzhihu:\n  question-id: 1\n  article-id:\n  art|\n---\n"))
-    (with-temp-buffer
-      (setq buffer-file-name "/tmp/article.md")
-      (insert source)
-      (goto-char (point-min))
-      (search-forward "|")
-      (delete-region (1- (point)) (point))
-      (should-not (zhihu--markdown-metadata-key-context))
-      (should-not (zhihu-completion-at-point)))))
-
-(ert-deftest zhihu-markdown-metadata-key-scan-is-case-sensitive ()
-  (with-temp-buffer
-    (setq buffer-file-name "/tmp/article.md")
-    (insert "---\nzhihu:\n  ARTICLE-ID:\n  |\n---\n")
-    (goto-char (point-min))
-    (search-forward "|")
-    (delete-region (1- (point)) (point))
-    (let ((capf (zhihu-completion-at-point)))
-      (should capf)
-      (should
-       (equal
-        (all-completions "" (nth 2 capf))
-        '("question-id:" "article-id:" "thought-id:"))))))
-
 (ert-deftest zhihu-metadata-key-candidates-follow-content-kind ()
   (should
    (equal
     (zhihu--metadata-key-candidate-fields nil)
-    '(:question-id :article-id :thought-id)))
+    '(:question-id :article-id)))
   (should
    (equal
     (zhihu--metadata-key-candidate-fields '(:column-id))
@@ -1342,7 +802,7 @@
   (should
    (equal
     (zhihu--metadata-key-candidate-fields '(:topics))
-    '(:article-id :thought-id)))
+    '(:article-id)))
   (should
    (equal
     (zhihu--metadata-key-candidate-fields '(:question-id))
@@ -1353,10 +813,6 @@
     (zhihu--metadata-key-candidate-fields '(:article-id))
     '(:column-id :creation-statement :content-source
       :reprint-permission :comment-permission :topics)))
-  (should
-   (equal
-    (zhihu--metadata-key-candidate-fields '(:thought-id))
-    '(:comment-permission :topics)))
   (should-not
    (zhihu--metadata-key-candidate-fields
     '(:question-id :article-id)))
@@ -1379,7 +835,7 @@
       (should
        (equal
         (all-completions "" (nth 2 capf))
-        '("question-id:" "article-id:" "thought-id:")))))
+        '("question-id:" "article-id:")))))
   (dolist
       (case
        '(("#metadata((\n  art\n)) <zhihu>\n"
@@ -1432,86 +888,6 @@
       (should-not (zhihu--typst-metadata-key-context))
       (should-not (zhihu-completion-at-point)))))
 
-(ert-deftest zhihu-column-id-capf-writes-id-in-source-formats ()
-  (dolist
-      (case
-       '((markdown
-          "/tmp/article.md"
-          "---\ntitle: A\nzhihu:\n  article-id:\n  column-id:\n---\n"
-          "  column-id: \"writers\"")
-         (typst
-          "/tmp/article.typ"
-          "#metadata((\n  article-id: none,\n  column-id: ,\n)) <zhihu>\n"
-          "  column-id: \"writers\",")))
-    (with-temp-buffer
-      (setq buffer-file-name (nth 1 case))
-      (insert (nth 2 case))
-      (goto-char (point-min))
-      (search-forward "column-id:" nil t)
-      (unless (eq (car case) 'typst)
-        (end-of-line))
-      (let ((requests 0))
-        (cl-letf
-            (((symbol-function 'zhihu--writable-columns)
-              (lambda ()
-                (cl-incf requests)
-                '((:id "writers"
-                   :title "写作者专栏"
-                   :articles-count 1
-                   :voteup-count 2
-                   :contributions-count 3)))))
-          (let* ((capf (zhihu-completion-at-point))
-                 (start (nth 0 capf))
-                 (end (nth 1 capf))
-                 (table (nth 2 capf))
-                 (properties (nthcdr 3 capf))
-                 (candidate
-                  (car (all-completions "" table)))
-                 (annotation
-                  (funcall
-                   (plist-get properties :annotation-function)
-                   candidate)))
-            (should (equal candidate "写作者专栏"))
-            (should (equal annotation "  ID writers"))
-            (delete-region start end)
-            (goto-char start)
-            (insert candidate)
-            ;; Completion frontends may invoke the callback from another
-            ;; buffer; source point must still land after the inserted ID.
-            (with-temp-buffer
-              (funcall
-               (plist-get properties :exit-function)
-               candidate 'finished))
-            (if (eq (car case) 'typst)
-                (should (eq (char-after) ?,))
-              (should (= (point) (line-end-position))))
-            (goto-char (point-min))
-            (should (search-forward (nth 3 case) nil t))
-            (should (= requests 1))))))))
-
-(ert-deftest zhihu-column-id-context-rejects-nested-and-blocked-fields ()
-  (dolist
-      (source
-       '("---\nzhihu:\n  article-id:\n  nested:\n    column-id:\n---\n"
-         "---\nzhihu:\n  article-id:\n---\n\ncolumn-id:\n"))
-    (with-temp-buffer
-      (setq buffer-file-name "/tmp/article.md")
-      (insert source)
-      (goto-char (point-min))
-      (search-forward "column-id:")
-      (should-not (zhihu--markdown-column-id-context))))
-  (dolist
-      (source
-       '("#metadata((nested: (column-id: \"x\"),)) <zhihu>\n"
-         "#metadata((note: \"column-id: x\",)) <zhihu>\n"
-         "#metadata((\n  // column-id: \"x\",\n)) <zhihu>\n"))
-    (with-temp-buffer
-      (setq buffer-file-name "/tmp/article.typ")
-      (insert source)
-      (goto-char (point-min))
-      (search-forward "column-id:")
-      (should-not (zhihu--typst-column-id-context)))))
-
 (ert-deftest zhihu-typst-column-context-uses-relative-dictionary-depth ()
   (with-temp-buffer
     (setq buffer-file-name "/tmp/article.typ")
@@ -1548,353 +924,6 @@
         (should-not (zhihu--cached-writable-columns))
         (should (= requests 2))))))
 
-(ert-deftest zhihu-markdown-user-mention-capf-is-lazy-and-writes-marker ()
-  (with-temp-buffer
-    (setq buffer-file-name "/tmp/article.md")
-    (insert
-     "---\nzhihu:\n  article-id:\n---\n\n正文 @zhang")
-    (goto-char (point-max))
-    (let ((searches 0)
-          (user
-           '(:name "张三"
-             :id "zhang-san"
-             :hash "0123456789abcdef0123456789abcdef"
-             :description "作者")))
-      (cl-letf
-          (((symbol-function 'zhihu--search-users)
-            (lambda (query)
-              (cl-incf searches)
-              (should (equal query "zhang"))
-              (list user))))
-        (let* ((capf (zhihu-completion-at-point))
-               (start (nth 0 capf))
-               (end (nth 1 capf))
-               (table (nth 2 capf))
-               (properties (nthcdr 3 capf)))
-          (should (= searches 0))
-          (let ((candidate
-                 (car (all-completions "zhang" table))))
-            (should (string-prefix-p "张三" candidate))
-            (should (string-match-p "作者" candidate))
-            (should (string-match-p "zhang-san" candidate))
-            (should (= searches 1))
-            (delete-region start end)
-            (goto-char start)
-            (insert candidate)
-            (with-temp-buffer
-              (funcall
-               (plist-get properties :exit-function)
-               candidate 'exact))
-            (should (= (point) (point-max)))
-            (should
-             (string-suffix-p
-              (concat
-               "正文 [@张三](https://www.zhihu.com/people/zhang-san "
-               "\"member_mention_"
-               "0123456789abcdef0123456789abcdef\")")
-              (buffer-string)))))))))
-
-(ert-deftest zhihu-markdown-user-mention-capf-rejects-non-body-contexts ()
-  (dolist
-      (source
-       '("---\ntitle: \"@zhang\"\nzhihu:\n  article-id:\n---\n"
-         "---\nzhihu:\n  article-id:\n---\n\n`@zhang`\n"
-         "---\nzhihu:\n  article-id:\n---\n\n`跨行\n@zhang\n代码`\n"
-         "---\nzhihu:\n  article-id:\n---\n\n```\n@zhang\n```\n"
-         "---\nzhihu:\n  article-id:\n---\n\n> ```\n> @zhang\n> ```\n"
-         "---\nzhihu:\n  article-id:\n---\n\n- ```\n  @zhang\n  ```\n"
-         "---\nzhihu:\n  article-id:\n---\n\n```\n```still-code\n@zhang\n```\n"
-         "---\nzhihu:\n  article-id:\n---\n\n[@zhang](https://example.com)\n"
-         "---\nzhihu:\n  article-id:\n---\n\n<a href=\"/\">@zhang</a>\n"
-         "---\nzhihu:\n  article-id:\n---\n\nme@zhang\n"))
-    (with-temp-buffer
-      (setq buffer-file-name "/tmp/article.md")
-      (insert source)
-      (goto-char (point-min))
-      (search-forward "@zhang")
-      (should-not (zhihu--markdown-user-mention-capf)))))
-
-(ert-deftest zhihu-markdown-html-state-ignores-code-and-closed-comments ()
-  (dolist
-      (source
-       '("---\nzhihu:\n  article-id:\n---\n\n```\n<div>\n```\n@zhang\n"
-         "---\nzhihu:\n  article-id:\n---\n\n`<div>` @zhang\n"
-         "---\nzhihu:\n  article-id:\n---\n\n<!-- <div> -->\n@zhang\n"))
-    (with-temp-buffer
-      (setq buffer-file-name "/tmp/article.md")
-      (insert source)
-      (goto-char (point-min))
-      (search-forward "@zhang")
-      (should (zhihu--markdown-user-mention-bounds)))))
-
-(ert-deftest zhihu-markdown-html-state-handles-many-tags ()
-  (with-temp-buffer
-    (setq buffer-file-name "/tmp/article.md")
-    (insert "---\nzhihu:\n  article-id:\n---\n\n")
-    (dotimes (_ 500)
-      (insert "<br>\n"))
-    (insert "@zhang")
-    (goto-char (point-max))
-    (should (zhihu--markdown-user-mention-bounds))))
-
-(ert-deftest zhihu-mode-manages-capf-and-caches ()
-  (with-temp-buffer
-    (setq buffer-file-name "/tmp/article.md"
-          major-mode 'markdown-mode)
-    (insert "---\nzhihu:\n  article-id:\n---\n")
-    (zhihu-mode 1)
-    (should zhihu-mode)
-    (should (memq #'zhihu-completion-at-point
-                  completion-at-point-functions))
-    (setq zhihu--column-completion-cache nil
-          zhihu--user-mention-completion-cache
-          '(("x"))
-          zhihu--topic-completion-cache
-          '(("topic")))
-    (run-hooks 'after-revert-hook)
-    (should
-     (eq zhihu--column-completion-cache
-         zhihu--column-completion-cache-unloaded))
-    (should-not zhihu--user-mention-completion-cache)
-    (should-not zhihu--topic-completion-cache)
-    (zhihu-mode -1)
-    (should-not
-     (memq #'zhihu-completion-at-point
-           completion-at-point-functions))
-    (should-not
-     (local-variable-p
-      'zhihu--column-completion-cache))
-    (should-not
-     (local-variable-p
-      'zhihu--topic-completion-cache))))
-
-(ert-deftest zhihu-mode-has-no-global-auto-detection ()
-  (should-not (fboundp 'zhihu--maybe-enable-mode))
-  (dolist (hook '(markdown-mode-hook
-                  typst-ts-mode-hook
-                  typst-mode-hook))
-    (should-not
-     (and (boundp hook)
-          (memq #'zhihu--maybe-enable-mode
-                (symbol-value hook))))))
-
-(ert-deftest zhihu-topic-capf-writes-names-in-source-formats ()
-  (dolist
-      (case
-       (list
-        (list
-         'markdown
-         "/tmp/article.md"
-         (concat
-          "---\n"
-          "zhihu:\n"
-          "  article-id:\n"
-          "  topics:\n"
-          "    - \"Other\"\n"
-          "    - \"Em\" # keep\n"
-          "---\nBody\n")
-         (concat
-          "---\n"
-          "zhihu:\n"
-          "  article-id:\n"
-          "  topics:\n"
-          "    - \"Other\"\n"
-          "    - \"Emacs \\\"Lisp\\\"\" # keep\n"
-          "---\nBody\n"))
-        (list
-         'typst
-         "/tmp/article.typ"
-         (concat
-          "#metadata((article-id: none, "
-          "topics: (\"Other\", \"Em\",),)) <zhihu>\n")
-         (concat
-          "#metadata((article-id: none, "
-          "topics: (\"Other\", \"Emacs \\\"Lisp\\\"\",),)) <zhihu>\n"))))
-    (with-temp-buffer
-      (setq buffer-file-name (nth 1 case))
-      (insert (nth 2 case))
-      (goto-char (point-min))
-      (search-forward "\"Em")
-      (let ((searches 0))
-        (cl-letf
-            (((symbol-function 'zhihu--search-article-topics)
-              (lambda (query)
-                (cl-incf searches)
-                (should (equal query "Em"))
-                (list
-                 (zhihu-test--topic-record
-                  "2" "Emacs \"Lisp\"" "Editor")))))
-          (let ((capf (zhihu-completion-at-point)))
-            (should (= searches 0))
-            (should
-             (equal
-              (zhihu-test--commit-capf-candidate capf "Em")
-              "Emacs \"Lisp\" — Editor (2)"))
-            (should (= searches 1))
-            (should (equal (buffer-string) (nth 3 case)))))))))
-
-(ert-deftest zhihu-topic-capf-rejects-answer-and-mixed-identities-without-search ()
-  (dolist
-      (case
-       (list
-        (list 'markdown "/tmp/answer.md"
-              (concat
-               "---\nzhihu:\n  question-id: \"123\"\n"
-               "  topics:\n    - \"No\"\n---\n"))
-        (list 'markdown "/tmp/mixed.md"
-              (concat
-               "---\nzhihu:\n  article-id:\n  thought-id:\n"
-               "  topics:\n    - \"No\"\n---\n"))
-        (list 'typst "/tmp/answer.typ"
-              (concat
-               "#metadata((question-id: \"123\", "
-               "topics: (\"No\",),)) <zhihu>\n"))
-        (list 'typst "/tmp/mixed.typ"
-              (concat
-               "#metadata((article-id: none, thought-id: none, "
-               "topics: (\"No\",),)) <zhihu>\n"))))
-    (with-temp-buffer
-      (setq buffer-file-name (nth 1 case))
-      (insert (nth 2 case))
-      (goto-char (point-min))
-      (search-forward "\"No")
-      (let ((searches 0))
-        (cl-letf
-            (((symbol-function 'zhihu--search-article-topics)
-              (lambda (&rest _args)
-                (cl-incf searches)
-                nil)))
-          (should-not (zhihu-completion-at-point))
-          (should (= searches 0)))))))
-
-(ert-deftest zhihu-article-topic-capf-allows-third-item-and-rejects-fourth ()
-  (dolist (count '(3 4))
-    (with-temp-buffer
-      (setq buffer-file-name "/tmp/article.md")
-      (insert
-       "---\nzhihu:\n  article-id:\n  topics:\n"
-       (mapconcat
-        (lambda (index)
-          (format "    - \"T%d\"" index))
-        (number-sequence 1 count)
-        "\n")
-       "\n---\n")
-      (goto-char (point-min))
-      (search-forward (format "\"T%d" count))
-      (let ((searches 0))
-        (cl-letf
-            (((symbol-function 'zhihu--search-article-topics)
-              (lambda (query)
-                (cl-incf searches)
-                (should (equal query "T3"))
-                (list (zhihu-test--topic-record "9" "Replacement")))))
-          (let ((capf (zhihu-completion-at-point)))
-            (if (= count 3)
-                (progn
-                  (should capf)
-                  (zhihu-test--commit-capf-candidate capf "T3")
-                  (should (= searches 1))
-                  (should
-                   (string-match-p
-                    (regexp-quote "    - \"Replacement\"")
-                    (buffer-string))))
-              (should-not capf)
-              (should (= searches 0)))))))))
-
-(ert-deftest zhihu-pin-topic-capf-allows-tenth-item-and-rejects-eleventh ()
-  (dolist (count '(10 11))
-    (with-temp-buffer
-      (setq buffer-file-name "/tmp/pin.md")
-      (insert
-       "---\nzhihu:\n  thought-id:\n  topics:\n"
-       (mapconcat
-        (lambda (index) (format "    - \"T%d\"" index))
-        (number-sequence 1 count)
-        "\n")
-       "\n---\n")
-      (goto-char (point-min))
-      (search-forward (format "\"T%d" count))
-      (let ((searches 0))
-        (cl-letf
-            (((symbol-function 'zhihu--search-article-topics)
-              (lambda (query)
-                (cl-incf searches)
-                (should (equal query "T10"))
-                (list (zhihu-test--topic-record "19" "Replacement")))))
-          (let ((capf (zhihu-completion-at-point)))
-            (if (= count 10)
-                (progn
-                  (should capf)
-                  (zhihu-test--commit-capf-candidate capf "T10")
-                  (should (= searches 1))
-                  (should
-                   (string-match-p
-                    (regexp-quote "    - \"Replacement\"")
-                    (buffer-string))))
-              (should-not capf)
-              (should (= searches 0)))))))))
-
-(ert-deftest zhihu-topic-capf-skips-empty-query-caches-and-filters-existing ()
-  (with-temp-buffer
-    (setq buffer-file-name "/tmp/article.md")
-    (insert
-     (concat
-      "---\nzhihu:\n  article-id:\n  topics:\n"
-      "    - \"Keep\"\n"
-      "    - \"\"\n"
-      "---\n"))
-    (goto-char (point-min))
-    (search-forward "    - \"")
-    (search-forward "    - \"")
-    (let (queries)
-      (cl-letf
-          (((symbol-function 'zhihu--search-article-topics)
-            (lambda (query)
-              (push query queries)
-              (pcase query
-                ("Em"
-                 (list
-                  (zhihu-test--topic-record "1" "First")
-                  (zhihu-test--topic-record "keep" "Keep")
-                  (zhihu-test--topic-record "2" "Second")))
-                ("None" nil)
-                (_ (ert-fail (format "Unexpected topic query %S" query)))))))
-        (let* ((capf (zhihu-completion-at-point))
-               (table (nth 2 capf)))
-          (should capf)
-          (should-not queries)
-          (should-not (funcall table "" nil t))
-          (should-not queries)
-          (should
-           (equal
-            (funcall table "Em" nil t)
-            '("First (1)" "Second (2)")))
-          (should
-           (equal
-            (funcall table "Em" nil t)
-            '("First (1)" "Second (2)")))
-          (should-not (funcall table "None" nil t))
-          (should-not (funcall table "None" nil t))
-          (should (equal (nreverse queries) '("Em" "None"))))))))
-
-(ert-deftest zhihu-html-converts-member-mention-links ()
-  (let* ((hash "0123456789abcdef0123456789abcdef")
-         (anchor
-          (zhihu-test--only-anchor
-           (zhihu--zhihuify-html
-            (format
-             (concat
-              "<p><a href=\"https://www.zhihu.com/people/zhang-san\" "
-              "title=\"member_mention_%s\"><strong>@张三</strong></a></p>")
-             hash)))))
-    (should (equal (dom-attr anchor 'class) "member_mention"))
-    (should (equal (dom-attr anchor 'href) "/people/zhang-san"))
-    (should (equal (dom-attr anchor 'data-hash) hash))
-    (should-not (dom-attr anchor 'title))
-    (let ((strong (car (dom-by-tag anchor 'strong))))
-      (should strong)
-      (should (equal (dom-inner-text strong) "@张三")))))
-
 (ert-deftest zhihu-html-preserves-ordinary-links ()
   (let ((anchor
          (zhihu-test--only-anchor
@@ -1910,32 +939,6 @@
       "https://www.zhihu.com/people/zhang-san"))
     (should (equal (dom-attr anchor 'title) "个人主页"))
     (should-not (dom-attr anchor 'data-hash))))
-
-(ert-deftest zhihu-html-member-mention-keeps-arbitrary-href ()
-  (let* ((hash "0123456789abcdef0123456789abcdef")
-         (href "https://example.com/not-a-profile")
-         (anchor
-          (zhihu-test--only-anchor
-           (zhihu--zhihuify-html
-            (format
-             "<a href=\"%s\" title=\"member_mention_%s\">@U</a>"
-             href hash)))))
-    (should (equal (dom-attr anchor 'class) "member_mention"))
-    (should (equal (dom-attr anchor 'href) href))
-    (should (equal (dom-attr anchor 'data-hash) hash))))
-
-(ert-deftest zhihu-html-rejects-malformed-member-mention-markers ()
-  (dolist
-      (link
-       (list
-        (concat
-         "<a href=\"https://www.zhihu.com/people/user\" "
-         "title=\"member_mention_\">@U</a>")
-        (concat
-         "<a href=\"https://www.zhihu.com/people/user\" "
-         "title=\"member_mention_0123456789abcdef0123456789abcdeg\">"
-         "@U</a>")))
-    (should-error (zhihu--zhihuify-html link))))
 
 (ert-deftest zhihu-inner-html-escapes-top-level-text ()
   (should
@@ -2007,19 +1010,18 @@
       (should
        (string-match-p
         (regexp-quote
-         "必须且只能包含 question-id、article-id 或 thought-id 中的一个")
+         "必须且只能包含 question-id 或 article-id 中的一个")
         message))))
   (let ((meta (zhihu--zhihu-meta-from-plist '(:article-id nil))))
     (should (eq (plist-get meta :kind) 'article))
     (dolist
         (field
-         '(:question-id :answer-id :column-id :thought-id :banner :topics
+         '(:question-id :answer-id :column-id :banner :topics
 			:creation-statement :content-source :toc
 			:reprint-permission :comment-permission))
       (should-not (plist-get meta field)))
     (should (plist-member meta :article-id))
-    (should-not (plist-get meta :article-id))
-    (should-not (plist-member meta :thought-id))))
+    (should-not (plist-get meta :article-id))))
 
 (ert-deftest zhihu-document-banner-and-toc-stay-out-of-channel-metadata ()
   (let ((channel
@@ -2045,19 +1047,17 @@
       (should-error
        (zhihu--zhihu-meta-from-plist (append (pcase field (:question-id nil) (:answer-id '(:question-id "123")) (_ '(:article-id nil))) (list field empty)))))))
 
-(ert-deftest zhihu-metadata-preserves-empty-content-id-slots ()
-  (dolist (case '((:article-id article) (:thought-id pin)))
-    (pcase-let ((`(,field ,kind) case))
-      (dolist (empty '(nil :null :json-null "" " \t\n"))
-        (let ((meta
-               (zhihu--zhihu-meta-from-plist (list field empty))))
-          (should (eq (plist-get meta :kind) kind))
-          (should (plist-member meta field))
-          (should-not (plist-get meta field))
-          (should
-           (equal
-            (zhihu--metadata-scalar-entries meta)
-            (list (cons field nil)))))))))
+(ert-deftest zhihu-metadata-preserves-empty-content-id-slot ()
+  (dolist (empty '(nil :null :json-null "" " \t\n"))
+    (let ((meta
+           (zhihu--zhihu-meta-from-plist (list :article-id empty))))
+      (should (eq (plist-get meta :kind) 'article))
+      (should (plist-member meta :article-id))
+      (should-not (plist-get meta :article-id))
+      (should
+       (equal
+        (zhihu--metadata-scalar-entries meta)
+        '((:article-id)))))))
 
 (ert-deftest zhihu-metadata-normalizes-article-topics ()
   (dolist (raw
@@ -2089,8 +1089,7 @@
 (ert-deftest zhihu-metadata-accepts-explicit-false-toc ()
   (dolist (false '(:false :json-false "false"))
     (dolist (identity '((:article-id nil)
-                        (:question-id "123")
-                        (:thought-id nil)))
+                        (:question-id "123")))
       (let ((meta
              (zhihu--source-meta-from-parts identity nil nil false)))
         (should-not (plist-get meta :toc))))))
@@ -2196,134 +1195,6 @@
          (:question-id "123" :column-id "writers")))
     (should-error (zhihu--zhihu-meta-from-plist raw))))
 
-(ert-deftest zhihu-metadata-infers-and-canonicalizes-pin-kind ()
-  (let ((new
-         (zhihu--source-meta-from-parts '(:thought-id nil :comment-permission "follower_n_days") "想法" nil))
-        (existing
-         (zhihu--zhihu-meta-from-plist '(:thought-id 123))))
-    (should (eq (plist-get new :kind) 'pin))
-    (should (plist-member new :thought-id))
-    (should-not (plist-get new :thought-id))
-    (should
-     (equal (plist-get new :comment-permission) "follower_n_days"))
-    (should (eq (plist-get existing :kind) 'pin))
-    (should (equal (plist-get existing :thought-id) "123"))
-    (should
-     (equal
-      (zhihu--metadata-scalar-entries existing)
-      '((:thought-id . "123"))))))
-
-(ert-deftest zhihu-metadata-rejects-thought-identity-conflicts ()
-  (dolist
-      (raw
-       '((:thought-id nil :question-id "1")
-         (:thought-id nil :answer-id "2")
-         (:thought-id nil :article-id nil)
-         (:thought-id nil :column-id "writers")
-         (:thought-id "4" :question-id "1")
-         (:thought-id "4" :article-id "3")))
-    (should-error (zhihu--zhihu-meta-from-plist raw))))
-
-(ert-deftest zhihu-metadata-rejects-unsupported-pin-fields ()
-  (dolist
-      (entry
-       '((:creation-statement "spoiler")
-         (:content-source "officialWebsite")
-         (:reprint-permission "allowed")))
-    (should-error
-     (zhihu--zhihu-meta-from-plist (append '(:thought-id nil) entry))))
-  (let ((meta
-         (zhihu--source-meta-from-parts
-          '(:thought-id nil) nil "./banner.png" t)))
-    (should (equal (plist-get meta :banner) "./banner.png"))
-    (should (plist-get meta :toc))))
-
-(ert-deftest zhihu-pin-topics-use-the-pin-limit ()
-  (let ((ten (cl-loop for index from 1 to 10
-                      collect (format "T%d" index)))
-        (eleven (cl-loop for index from 1 to 11
-                         collect (format "T%d" index))))
-    (should
-     (equal
-      (plist-get
-       (zhihu--zhihu-meta-from-plist (list :thought-id nil :topics ten))
-       :topics)
-      ten))
-    (should-error
-     (zhihu--zhihu-meta-from-plist (list :thought-id nil :topics eleven)))))
-
-(ert-deftest zhihu-markdown-generic-toc-is-strict-and-channel-independent ()
-  (let ((meta
-         (zhihu--md-parse-frontmatter-meta
-          (concat
-           "toc: false\n"
-           "zhihu:\n"
-           "  article-id:\n"))))
-    (should (eq (plist-get meta :kind) 'article))
-    (should-not (plist-get meta :toc)))
-  (let ((meta
-         (zhihu--md-parse-frontmatter-meta
-          "toc: true\nzhihu:\n  question-id: \"123\"\n")))
-    (should (eq (plist-get meta :kind) 'answer))
-    (should (plist-get meta :toc)))
-  (should-error
-   (zhihu--md-parse-frontmatter-meta
-    "toc: null\nzhihu:\n  article-id:\n"))
-  (should-error
-   (zhihu--md-parse-frontmatter-meta
-    "zhihu:\n  article-id:\n  toc: true\n"))
-  (should-error
-   (zhihu--md-parse-frontmatter-meta
-    "zhihu:\n  article-id:\n  enable-table-of-contents: true\n")))
-
-(ert-deftest zhihu-markdown-article-topics-round-trip-as-strings ()
-  (let* ((meta
-          (zhihu--zhihu-meta-from-plist '(:article-id nil :topics ["123" "true" "comma, quote\""])))
-         (yaml (zhihu--format-zhihu-yaml meta))
-         (round-tripped
-          (zhihu--md-parse-frontmatter-meta yaml)))
-    (should
-     (string-match-p
-      (regexp-quote
-       "  topics:\n    - \"123\"\n    - \"true\"\n    - \"comma, quote\\\"\"")
-      yaml))
-    (should
-     (equal (plist-get round-tripped :topics)
-            '("123" "true" "comma, quote\"")))))
-
-(ert-deftest zhihu-markdown-rejects-invalid-article-topics ()
-  (dolist
-      (yaml
-       '("zhihu:\n  article-id:\n  topics: []\n"
-         "zhihu:\n  article-id:\n  topics: Emacs\n"
-         "zhihu:\n  article-id:\n  topics: {name: Emacs}\n"
-         "zhihu:\n  article-id:\n  topics: null\n"))
-    (should-error (zhihu--md-parse-frontmatter-meta yaml))))
-
-(ert-deftest zhihu-markdown-preserves-string-valued-scalars ()
-  (dolist (title '("123" "true" "null"))
-    (let* ((source-meta
-            (zhihu--source-meta-from-parts '(:article-id nil :column-id "123") nil "true"))
-           (content
-            (zhihu--format-new-source-metadata
-             'markdown
-             (plist-put source-meta :title title)))
-           (frontmatter
-            (car (zhihu--md-split-frontmatter content)))
-           (meta (zhihu--md-parse-frontmatter-meta frontmatter))
-           (yaml
-            (yaml-parse-string frontmatter
-                               :object-type 'plist
-                               :string-values t)))
-      (should (eq (plist-get meta :kind) 'article))
-      (should (equal (plist-get meta :title) title))
-      (should (equal (plist-get meta :column-id) "123"))
-      (should (equal (plist-get meta :banner) "true"))
-      (should (equal (plist-get yaml :title) title))
-      (should (equal (plist-get yaml :banner) "true"))
-      (should-not (plist-member (plist-get yaml :zhihu) :banner))
-      (should-not (plist-member (plist-get yaml :zhihu) :title)))))
-
 (ert-deftest zhihu-question-title-uses-the-question-endpoint ()
   (let (request)
     (cl-letf
@@ -2339,545 +1210,6 @@
     (should
      (equal request
             '("GET" "https://www.zhihu.com/api/v4/questions/123")))))
-
-(ert-deftest zhihu-new-answer-enables-mode-explicitly ()
-  (let (created-meta mode-argument)
-    (cl-letf
-        (((symbol-function 'zhihu--create-source-file)
-          (lambda (file meta)
-            (should (equal file "/tmp/answer.md"))
-            (setq created-meta meta)
-            file))
-         ((symbol-function 'zhihu-mode)
-          (lambda (&optional argument)
-            (setq mode-argument argument))))
-      (should
-       (equal
-        (zhihu-new-answer "123" "/tmp/answer.md")
-        "/tmp/answer.md")))
-    (should (eq (plist-get created-meta :kind) 'answer))
-    (should (equal (plist-get created-meta :question-id) "123"))
-    (should (= mode-argument 1))))
-
-(ert-deftest zhihu-create-source-uses-canonical-meta-and-rejects-existing-file ()
-  (dolist (raw-meta
-           '((:question-id "123")
-             (:article-id nil :column-id "writers")
-             (:thought-id nil)))
-    (let* ((directory (make-temp-file "zhihu-test-source-" t))
-           (meta (zhihu--zhihu-meta-from-plist raw-meta))
-           (kind (plist-get meta :kind))
-           (parent (expand-file-name "missing/parents" directory))
-           (file
-            (expand-file-name
-             (format "%s-source.md" kind)
-             parent))
-           opened)
-      (unwind-protect
-          (cl-letf (((symbol-function 'find-file)
-                     (lambda (path)
-                       (push path opened)))
-                    ((symbol-function 'zhihu--question-title)
-                     (lambda (question-id)
-                       (should (equal question-id "123"))
-                       "Question")))
-            (should-not (file-exists-p parent))
-            (zhihu--create-source-file file meta)
-            (should (file-directory-p parent))
-            (should-error (zhihu--create-source-file file meta)
-                          :type 'user-error)
-            (should (equal opened (list file)))
-            (let ((written-meta (zhihu--read-source-meta file)))
-              (dolist (key
-                       '(:kind :question-id :answer-id
-                               :article-id :column-id :thought-id))
-                (should (equal (plist-get written-meta key)
-                               (plist-get meta key))))
-              (dolist (key '(:article-id :thought-id))
-                (should
-                 (eq (and (plist-member written-meta key) t)
-                     (and (plist-member meta key) t))))
-              (should
-               (equal (plist-get written-meta :title)
-                      (and (eq kind 'answer) "Question")))))
-        (delete-directory directory t)))))
-
-(ert-deftest zhihu-new-source-requires-a-supported-file-path ()
-  (let ((directory (make-temp-file "zhihu-test-source-" t ".md")))
-    (unwind-protect
-        (progn
-          (should-error (zhihu--new-source-spec directory)
-                        :type 'user-error)
-          (should-error
-           (zhihu--new-source-spec
-            (expand-file-name "article.txt" (file-name-directory directory)))
-           :type 'user-error)
-          (should-error
-           (zhihu--new-source-spec
-            (expand-file-name "   .md" (file-name-directory directory)))
-           :type 'user-error)
-          (should-error
-           (zhihu--new-source-spec
-            (expand-file-name
-             (concat "article" (string 1) ".md")
-             (file-name-directory directory)))
-           :type 'user-error)
-          (dolist (name '("..md" "...md"))
-            (should-error
-             (zhihu--new-source-spec
-              (expand-file-name name (file-name-directory directory)))
-             :type 'user-error))
-          (let ((default-directory
-                 "/ssh:example.invalid:/tmp/zhihu-test/"))
-            (should-error (zhihu--new-source-spec "article.md")
-                          :type 'user-error)))
-      (delete-directory directory t))))
-
-(ert-deftest zhihu-create-source-rejects-a-dangling-symlink ()
-  (let* ((directory (make-temp-file "zhihu-test-source-" t))
-         (file (expand-file-name "article.md" directory))
-         (meta
-          (zhihu--zhihu-meta-from-plist '(:article-id nil))))
-    (unwind-protect
-        (progn
-          (make-symbolic-link "missing.md" file)
-          (should (file-symlink-p file))
-          (should-not (file-exists-p file))
-          (should-error (zhihu--create-source-file file meta)
-                        :type 'user-error)
-          (should (file-symlink-p file)))
-      (delete-directory directory t))))
-
-(ert-deftest zhihu-new-source-preserves-empty-content-id-slots ()
-  (let* ((article
-          (plist-put
-           (zhihu--zhihu-meta-from-plist '(:article-id nil))
-           :title "Article"))
-         (answer
-          (plist-put
-           (zhihu--zhihu-meta-from-plist '(:question-id "123"))
-           :title "Question"))
-         (pin
-          (plist-put
-           (zhihu--zhihu-meta-from-plist '(:thought-id nil))
-           :title "")))
-    (should
-     (equal (zhihu--format-new-source-metadata 'typst article)
-            (concat
-             "#metadata((\n"
-             "  article-id: none,\n"
-             ")) <zhihu>\n\n"
-             "#set document(title: \"Article\")\n\n")))
-    (should
-     (equal (zhihu--format-new-source-metadata 'markdown article)
-            (concat
-             "---\n"
-             "title: \"Article\"\n"
-             "zhihu:\n"
-             "  article-id:\n"
-             "---\n\n")))
-    (dolist (format '(typst markdown))
-      (let ((source (zhihu--format-new-source-metadata format answer)))
-        (should (string-match-p "question-id: \"123\"" source))
-        (should-not
-         (string-match-p "answer-id" source))))
-    (dolist (format '(typst markdown))
-      (let ((source (zhihu--format-new-source-metadata format pin)))
-        (should
-         (string-match-p
-          (if (eq format 'typst)
-              "thought-id: none"
-            "thought-id:[[:space:]]*$")
-          source))))))
-
-(ert-deftest zhihu-new-source-writes-canonical-generic-document-fields ()
-  (let ((article
-         (plist-put
-          (zhihu--source-meta-from-parts
-           '(:article-id nil) nil "./cover.jpg" t)
-          :title "Article")))
-    (should
-     (equal
-      (zhihu--format-new-source-metadata 'typst article)
-      (concat
-       "#metadata(\"./cover.jpg\") <banner>\n"
-       "#metadata((\n"
-       "  article-id: none,\n"
-       ")) <zhihu>\n\n"
-       "#set document(title: \"Article\")\n\n"
-       "#outline()\n\n")))
-    (should
-     (equal
-      (zhihu--format-new-source-metadata 'markdown article)
-      (concat
-       "---\n"
-       "title: \"Article\"\n"
-       "banner: \"./cover.jpg\"\n"
-       "toc: true\n"
-       "zhihu:\n"
-       "  article-id:\n"
-       "---\n\n")))
-    ))
-
-(ert-deftest zhihu-pin-metadata-round-trips-all-source-formats ()
-  (let ((meta
-         (zhihu--source-meta-from-parts '(:thought-id "456" :topics ["Emacs" "org-mode"] :comment-permission "follower_n_days") "Pin title" "./banner.png")))
-    (dolist (case '((typst . ".typ")
-                    (markdown . ".md")))
-      (pcase-let ((`(,format . ,suffix) case))
-        (zhihu-test--with-temp-file
-         suffix
-         (zhihu--format-new-source-metadata format meta)
-         (lambda (file)
-           (let ((round-tripped (zhihu--read-source-meta file)))
-             (should (eq (plist-get round-tripped :kind) 'pin))
-             (should (equal (plist-get round-tripped :thought-id) "456"))
-             (should
-              (equal (plist-get round-tripped :topics)
-                     '("Emacs" "org-mode")))
-             (should
-              (equal
-               (plist-get round-tripped :comment-permission)
-               "follower_n_days"))
-             (should
-              (equal (plist-get round-tripped :banner)
-                     "./banner.png")))))))))
-
-(ert-deftest zhihu-empty-content-id-slots-round-trip-all-source-formats ()
-  (dolist (identity '((:article-id article) (:thought-id pin)))
-    (pcase-let ((`(,field ,kind) identity))
-      (let ((meta
-             (zhihu--source-meta-from-parts (list field nil) "Title" nil)))
-        (dolist (case '((typst . ".typ")
-                        (markdown . ".md")))
-          (pcase-let ((`(,format . ,suffix) case))
-            (let* ((field-name (substring (symbol-name field) 1))
-                   (source
-                    (zhihu--format-new-source-metadata format meta))
-                   (empty-marker
-                    (pcase format
-                      ('typst (format "  %s: none," field-name))
-                      ('markdown (format "  %s:" field-name)))))
-              (should
-               (string-match-p
-                (concat "^" (regexp-quote empty-marker) "$")
-                source))
-              (zhihu-test--with-temp-file
-               suffix source
-               (lambda (file)
-                 (let ((round-tripped (zhihu--read-source-meta file)))
-                   (should (eq (plist-get round-tripped :kind) kind))
-                   (should (plist-member round-tripped field))
-                   (should-not (plist-get round-tripped field))
-                   (zhihu--write-zhihu-meta file round-tripped)
-                   (setq round-tripped (zhihu--read-source-meta file))
-                   (should (eq (plist-get round-tripped :kind) kind))
-                   (should (plist-member round-tripped field))
-                   (should-not (plist-get round-tripped field))
-                   (setq round-tripped
-                         (plist-put round-tripped field "456"))
-                   (zhihu--write-zhihu-meta file round-tripped)
-                   (let ((updated (zhihu--read-source-meta file)))
-                     (should (eq (plist-get updated :kind) kind))
-                     (should (equal (plist-get updated field) "456")))))))))))))
-
-(ert-deftest zhihu-sources-require-an-explicit-content-identity ()
-  (let ((message
-         (condition-case err
-             (progn
-               (zhihu--md-parse-frontmatter-meta "title: Markdown")
-               nil)
-           (error (error-message-string err)))))
-    (should message)
-    (should
-     (string-match-p
-      (regexp-quote
-       "必须且只能包含 question-id、article-id 或 thought-id 中的一个")
-      message)))
-  (cl-letf (((symbol-function 'zhihu--typst-query-metadata)
-             (lambda (_file) nil)))
-    (let ((message
-           (condition-case err
-               (progn
-                 (zhihu--read-source-meta "/tmp/article.typ")
-                 nil)
-             (error (error-message-string err)))))
-      (should message)
-      (should
-       (string-match-p
-        (regexp-quote
-         "必须且只能包含 question-id、article-id 或 thought-id 中的一个")
-        message)))))
-
-(ert-deftest zhihu-writers-preserve-an-empty-article-id-slot ()
-  (let ((meta
-         (zhihu--zhihu-meta-from-plist '(:article-id nil))))
-    (dolist
-        (case
-         `((".typ"
-            . ("#metadata(\"./cover.jpg\") <banner>\n\
-#metadata((article-id: \"456\")) <zhihu>\n\
-#set document(title: \"Title\")\n\nBody\n"
-               ,#'zhihu--typst-write-native-metadata
-               "article-id: \"456\""
-               "article-id: none"
-               "<banner>"))
-           (".md"
-            . ("---\ntitle: Title\nbanner: \"./cover.jpg\"\n\
-zhihu:\n  article-id: \"456\"\n\
-other: keep\n---\nBody\n"
-               ,#'zhihu--md-write-zhihu-meta
-               "article-id: \"456\""
-               "article-id:"
-               "banner: \"./cover.jpg\""))))
-      (pcase-let
-          ((`(,suffix
-              . (,source ,writer ,old-marker ,empty-marker ,banner-marker))
-            case))
-        (zhihu-test--with-temp-file
-         suffix
-         source
-         (lambda (file)
-           (funcall writer file meta)
-           (let ((once
-                  (with-temp-buffer
-                    (insert-file-contents file)
-                    (buffer-string))))
-             (should-not
-              (string-match-p (regexp-quote old-marker) once))
-             (should
-              (string-match-p (regexp-quote empty-marker) once))
-             (should (string-match-p (regexp-quote banner-marker) once))
-             (should (string-match-p "Title" once))
-             (should (string-match-p "Body" once))
-             (let ((round-tripped (zhihu--read-source-meta file)))
-               (should (eq (plist-get round-tripped :kind) 'article))
-               (should (plist-member round-tripped :article-id))
-               (should-not (plist-get round-tripped :article-id)))
-             (funcall writer file meta)
-             (should
-              (equal
-               once
-               (with-temp-buffer
-                 (insert-file-contents file)
-                 (buffer-string)))))))))))
-
-(ert-deftest zhihu-markdown-yaml-strings-use-json-escaping ()
-  (let* ((column-id (concat "quote\" slash\\ newline\n tab\t control-"
-                            (string 1)))
-         (yaml
-          (zhihu--format-zhihu-yaml
-           (list :kind 'article
-                 :article-id nil
-                 :column-id column-id))))
-    (should
-     (string-match-p
-      (regexp-quote
-       "column-id: \"quote\\\" slash\\\\ newline\\n tab\\t control-\\u0001\"")
-      yaml))))
-
-(ert-deftest zhihu-markdown-splits-empty-and-eof-frontmatter ()
-  (should
-   (equal (zhihu--md-split-frontmatter "---\n---\n正文\n")
-          '("" . "正文\n")))
-  (should
-   (equal (zhihu--md-split-frontmatter "---\ntitle: T\n---")
-          '("title: T" . ""))))
-
-(ert-deftest zhihu-markdown-rejects-unclosed-frontmatter ()
-  (dolist (text '("---\n"
-                  "---\ntitle: T\n"
-                  "---\ntitle: T\n正文"))
-    (let ((message
-           (condition-case err
-               (progn
-                 (zhihu--md-split-frontmatter text)
-                 nil)
-             (error (error-message-string err)))))
-      (should message)
-      (should
-       (string-match-p
-        (regexp-quote
-         "Markdown front matter 缺少结束分隔符 ---")
-        message))))
-  ;; A thematic break outside the first line is ordinary Markdown body.
-  (let ((body "正文\n---\n仍是正文\n"))
-    (should
-     (equal (zhihu--md-split-frontmatter body)
-            (cons nil body)))))
-
-(ert-deftest zhihu-markdown-unclosed-frontmatter-read-and-write-are-atomic ()
-  (let ((source "---\ntitle: \"Title\"\n正文\n"))
-    (zhihu-test--with-temp-file
-     ".md" source
-     (lambda (file)
-       (should-error (zhihu--md-read-meta file))
-       (should-error
-        (zhihu--md-write-zhihu-meta
-         file
-         (list :kind 'article
-               :article-id "456")))
-       (should
-        (equal
-         (with-temp-buffer
-           (insert-file-contents file)
-           (buffer-string))
-         source))))))
-
-(ert-deftest zhihu-markdown-writer-replaces-zhihu-block-across-blank-lines ()
-  (zhihu-test--with-temp-file
-   ".md"
-   (concat
-    "---\n"
-    "title: \"Title\"\n"
-    "zhihu:\n"
-    "  question-id: \"123\"\n"
-    "\n"
-    "# zhihu mapping 内部的顶层注释\n"
-    "  # 以及缩进注释\n"
-    "  answer-id: \"old\"\n"
-    "other: keep\n"
-    "---\n"
-    "正文\n")
-   (lambda (file)
-     (zhihu--md-write-zhihu-meta
-      file
-      (list :kind 'answer
-            :question-id "123"
-            :answer-id "456"))
-     (let ((source
-            (with-temp-buffer
-              (insert-file-contents file)
-              (buffer-string))))
-       (should-not (string-match-p "answer-id: \"old\"" source))
-       (should (string-match-p "^other: keep$" source))
-       (let ((meta (zhihu--md-read-meta file)))
-         (should (equal (plist-get meta :question-id) "123"))
-         (should (equal (plist-get meta :answer-id) "456")))))))
-
-(ert-deftest zhihu-markdown-rejects-duplicate-channel-metadata ()
-  (dolist
-      (frontmatter
-       '("zhihu:\n  article-id:\n  article-id: \"456\"\n"
-         "zhihu:\n  article-id:\nzhihu:\n  thought-id:\n"
-         "zhihu:\n  article-id:\n  topics: [\"A\"]\n  topics: [\"B\"]\n"))
-    (let ((message
-           (condition-case err
-               (progn
-                 (zhihu--md-parse-frontmatter-meta frontmatter)
-                 nil)
-             (error (error-message-string err)))))
-      (should message)
-      (should (string-match-p "不能重复" message)))))
-
-(ert-deftest zhihu-markdown-zhihu-mapping-is-block-and-writer-locatable ()
-  (should-error
-   (zhihu--md-parse-frontmatter-meta
-    "zhihu: {article-id: null}\n"))
-  (dolist (key '("\"zhihu\" :" "'zhihu':"))
-    (zhihu-test--with-temp-file
-     ".md"
-     (format "---\ntitle: Article\n%s\n  article-id:\n---\n" key)
-     (lambda (file)
-       (let ((meta (zhihu--md-read-meta file)))
-         (should (eq (plist-get meta :kind) 'article))
-         (should (plist-member meta :article-id))
-         (setq meta (plist-put meta :article-id "456"))
-         (zhihu--md-write-zhihu-meta file meta))
-       (let ((source
-              (with-temp-buffer
-                (insert-file-contents file)
-                (buffer-string))))
-         (should (= (zhihu--md-top-level-key-count source "zhihu") 1))
-         (should (string-match-p "^zhihu:$" source))
-         (should
-          (equal
-           (plist-get (zhihu--md-read-meta file) :article-id)
-           "456")))))))
-
-(ert-deftest zhihu-markdown-publish-settings-round-trip ()
-  (zhihu-test--with-temp-file
-   ".md"
-   (concat
-    "---\n"
-    "title: \"Title\"\n"
-    "banner: \"./images/cover.jpg\"\n"
-    "toc: true\n"
-    "zhihu:\n"
-    "  article-id: \"456\"\n"
-    "  creation-statement: ai_creation\n"
-    "  content-source: officialWebsite\n"
-    "  reprint-permission: need_payment\n"
-    "  comment-permission: followee\n"
-    "---\n"
-    "正文\n")
-   (lambda (file)
-     (let ((meta (zhihu--md-read-meta file)))
-       (should
-        (equal
-         (mapcar (lambda (key) (plist-get meta key))
-                 '(:banner :creation-statement :content-source
-			   :toc
-			   :reprint-permission :comment-permission))
-         '("./images/cover.jpg" "ai_creation" "officialWebsite"
-           t "need_payment" "followee")))
-       (zhihu--md-write-zhihu-meta file meta)
-       (let ((round-tripped (zhihu--md-read-meta file)))
-         (should
-          (equal
-           (mapcar (lambda (key) (plist-get round-tripped key))
-                   '(:banner :creation-statement :content-source
-			     :toc
-			     :reprint-permission :comment-permission))
-           '("./images/cover.jpg" "ai_creation" "officialWebsite"
-             t "need_payment" "followee"))))
-       (dolist (key
-                '(:creation-statement :content-source
-				      :reprint-permission :comment-permission))
-         (setq meta (plist-put meta key nil)))
-       (zhihu--md-write-zhihu-meta file meta)
-       (let ((source
-              (with-temp-buffer
-                (insert-file-contents file)
-                (buffer-string))))
-         (dolist (field
-                  '("creation-statement" "content-source"
-                    "reprint-permission" "comment-permission"))
-           (should-not (string-match-p field source)))
-         (should (string-match-p "^toc: true$" source))
-         (should-not (string-match-p "^[ \t]+toc:" source))
-         (should
-          (string-match-p
-           (regexp-quote "banner: \"./images/cover.jpg\"")
-           source))
-         (should-not
-          (string-match-p
-           (regexp-quote "  banner: \"./images/cover.jpg\"")
-           source)))))))
-
-(ert-deftest zhihu-markdown-banner-is-top-level-only-and-strict ()
-  (let ((meta
-         (zhihu--md-parse-frontmatter-meta
-          (concat
-           "banner: \"./canonical.jpg\"\n"
-           "zhihu:\n"
-           "  question-id: \"123\"\n"
-           "  banner: \"./ignored.jpg\"\n"))))
-    (should (eq (plist-get meta :kind) 'answer))
-    (should (equal (plist-get meta :banner) "./canonical.jpg")))
-  (should-not
-   (plist-get
-    (zhihu--md-parse-frontmatter-meta
-     "zhihu:\n  article-id:\n  banner: \"./ignored.jpg\"\n")
-    :banner))
-  (dolist
-      (frontmatter
-       '("banner: null\nzhihu:\n  article-id:\n"
-         "banner: \"\"\nzhihu:\n  article-id:\n"
-         "banner: [\"./cover.jpg\"]\nzhihu:\n  article-id:\n"
-         "banner: one\nbanner: two\nzhihu:\n  article-id:\n"
-         "'banner': one\n\"banner\": two\nzhihu:\n  article-id:\n"))
-    (should-error (zhihu--md-parse-frontmatter-meta frontmatter))))
 
 (ert-deftest zhihu-typst-root-resolves-all-absolute-imports-together ()
   (let* ((root (make-temp-file "zhihu-test-typst-root-" t))
@@ -5404,227 +3736,6 @@ other: keep\n---\nBody\n"
         "/tmp/"
         "answer")))))
 
-(ert-deftest zhihu-pin-image-dimensions-support-common-formats ()
-  (let* ((png
-          (concat
-           (unibyte-string
-            #x89 #x50 #x4e #x47 #x0d #x0a #x1a #x0a
-            0 0 0 13)
-           "IHDR"
-           (zhihu-test--u32-be 320)
-           (zhihu-test--u32-be 240)))
-         (gif
-          (concat "GIF89a"
-                  (unibyte-string #x40 #x01 #xf0 #x00)))
-         (jpeg
-          (unibyte-string
-           #xff #xd8
-           #xff #xe0 0 4 0 0
-           #xff #xc0 0 11 8
-           0 #xf0 #x01 #x40
-           3 1 0 2 0 3 0
-           #xff #xd9))
-         (webp
-          (concat
-           "RIFF"
-           (unibyte-string 22 0 0 0)
-           "WEBPVP8X"
-           (unibyte-string 10 0 0 0 0 0 0 0
-                           #x3f #x01 0
-                           #xef 0 0))))
-    (should (equal (zhihu--image-dimensions png "image/png")
-                   '(320 . 240)))
-    (should (equal (zhihu--image-dimensions gif "image/gif")
-                   '(320 . 240)))
-    (should (equal (zhihu--image-dimensions jpeg "image/jpeg")
-                   '(320 . 240)))
-    (should (equal (zhihu--image-dimensions webp "image/webp")
-                   '(320 . 240)))
-    (should-error
-     (zhihu--image-dimensions
-      (zhihu-test--utf8-bytes "not an image")
-      "image/png"))))
-
-(ert-deftest zhihu-pin-content-extracts-images-in-document-order ()
-  (let (uploaded)
-    (cl-letf
-        (((symbol-function 'zhihu--img-bytes-and-mime)
-          (lambda (src base-dir)
-            (should (equal base-dir "/tmp/source/"))
-            (cons "image/png" (zhihu-test--utf8-bytes src))))
-         ((symbol-function 'zhihu--image-dimensions)
-          (lambda (bytes mime)
-            (should (equal mime "image/png"))
-            (if (equal bytes (zhihu-test--utf8-bytes "one.png"))
-                '(100 . 80)
-              '(200 . 160))))
-         ((symbol-function 'zhihu--upload-bytes)
-          (lambda (bytes mime source)
-            (should (equal mime "image/png"))
-            (should (equal source "pin"))
-            (push bytes uploaded)
-            (format "https://picx.zhimg.com/%s"
-                    (decode-coding-string bytes 'utf-8)))))
-      (let* ((content
-              (zhihu--pin-content-from-html
-               (concat
-                "<p>before<img src=\"one.png\">after</p>"
-                "<p><img src=\"two.png\"></p>")
-               "/tmp/source/"))
-             (medias (plist-get content :medias)))
-        (should (equal (plist-get content :html)
-                       "<p>beforeafter</p>"))
-        (should (= (plist-get content :text-length) 11))
-        (should-not
-         (string-match-p "<img" (plist-get content :html)))
-        (should
-         (equal
-          (append medias nil)
-          '((:image
-             (:height 80 :width 100
-		      :url "https://picx.zhimg.com/one.png"
-		      :originalUrl "https://picx.zhimg.com/one.png"))
-            (:image
-             (:height 160 :width 200
-		      :url "https://picx.zhimg.com/two.png"
-		      :originalUrl "https://picx.zhimg.com/two.png")))))
-        (dolist (media (append medias nil))
-          (let ((image (plist-get media :image)))
-            (should-not (plist-member image :watermark))
-            (should-not (plist-member image :watermarkUrl))))))
-    (should
-     (equal
-      (mapcar
-       (lambda (bytes) (decode-coding-string bytes 'utf-8))
-       (nreverse uploaded))
-      '("one.png" "two.png")))))
-
-(ert-deftest zhihu-pin-caption-degrades-to-body-text-without-using-alt ()
-  (let ((uploads 0))
-    (cl-letf
-        (((symbol-function 'zhihu--img-bytes-and-mime)
-          (lambda (src _base-dir)
-            (cons "image/png" (zhihu-test--utf8-bytes src))))
-         ((symbol-function 'zhihu--image-dimensions)
-          (lambda (&rest _args) '(20 . 10)))
-         ((symbol-function 'zhihu--upload-bytes)
-          (lambda (_bytes _mime source)
-            (should (equal source "pin"))
-            (cl-incf uploads)
-            "https://picx.zhimg.com/image.png")))
-      (let ((captioned
-             (zhihu--pin-content-from-html
-              (concat
-               "<p>before</p>"
-               "<p><img src=\"captioned.png\" "
-               "alt=\"替代文字\" data-caption=\"  图片   注释  \"></p>")
-              "/tmp/"))
-            (alt-only
-             (zhihu--pin-content-from-html
-              "<p><img src=\"alt-only.png\" alt=\"替代文字\"></p>"
-              "/tmp/")))
-        (should
-         (equal
-          (plist-get captioned :html)
-          "<p>before</p><p>图片 注释</p>"))
-        (should (= (plist-get captioned :text-length) 11))
-        (should (equal (plist-get alt-only :html) ""))
-        (should (= (plist-get alt-only :text-length) 0))
-        (should (= (length (plist-get captioned :medias)) 1))
-        (should (= (length (plist-get alt-only :medias)) 1))))
-    (should (= uploads 2))))
-
-(ert-deftest zhihu-pin-images-are-preflighted-before-upload ()
-  (let ((uploads 0))
-    (cl-letf
-        (((symbol-function 'zhihu--img-bytes-and-mime)
-          (lambda (src _base-dir)
-            (if (equal src "external")
-                'external
-              (cons "image/png" (zhihu-test--utf8-bytes src)))))
-         ((symbol-function 'zhihu--image-dimensions)
-          (lambda (&rest _args) '(1 . 1)))
-         ((symbol-function 'zhihu--upload-bytes)
-          (lambda (&rest _args)
-            (cl-incf uploads)
-            "https://picx.zhimg.com/image.png")))
-      (should-error
-       (zhihu--pin-content-from-html
-        "<img src=\"local\"><img src=\"external\">"
-        "/tmp/")))
-    (should (= uploads 0))))
-
-(ert-deftest zhihu-pin-content-keeps-equations-out-of-photo-media ()
-  (let ((uploads 0))
-    (cl-letf
-        (((symbol-function 'zhihu--img-bytes-and-mime)
-          (lambda (src _base-dir)
-            (should (equal src "photo.png"))
-            (cons "image/png" (string-to-unibyte "photo"))))
-         ((symbol-function 'zhihu--image-dimensions)
-          (lambda (&rest _args) '(20 . 10)))
-         ((symbol-function 'zhihu--upload-bytes)
-          (lambda (_bytes _mime source)
-            (should (equal source "pin"))
-            (cl-incf uploads)
-            "https://picx.zhimg.com/photo.png")))
-      (let* ((content
-              (zhihu--pin-content-from-html
-               (concat
-                "<p><img eeimg=\"1\" "
-                "src=\"//www.zhihu.com/equation?tex=x\" alt=\"x\"></p>"
-                "<p><img src=\"photo.png\"></p>")
-               "/tmp/"))
-             (html (plist-get content :html)))
-        (should (= uploads 1))
-        (should (= (plist-get content :text-length) 0))
-        (should
-         (equal
-          (zhihu-test--image-srcs html)
-          '("//www.zhihu.com/equation?tex=x")))
-        (should (= (length (plist-get content :medias)) 1))))))
-
-(ert-deftest zhihu-pin-content-rejects-lossy-or-empty-input ()
-  (cl-letf
-      (((symbol-function 'zhihu--img-bytes-and-mime)
-        (lambda (&rest _args)
-          (ert-fail "Validation should fail before reading images"))))
-    (should-error
-     (zhihu--pin-content-from-html
-      ""
-      "/tmp/"))
-    (should-error
-     (zhihu--pin-content-from-html
-      (concat
-       "<a href=\"https://example.test\" "
-       "data-draft-type=\"link-card\">card</a>")
-      "/tmp/"))
-    (should-error
-     (zhihu--pin-content-from-html
-      (concat
-       "<p><img eeimg=\"1\" "
-       "src=\"//www.zhihu.com/equation?tex=x\"></p>")
-      "/tmp/"))
-    (should-error
-     (zhihu--pin-content-from-html
-      (mapconcat
-       (lambda (_index) "<img src=\"x.png\">")
-       (number-sequence 1 19)
-       "")
-      "/tmp/"))))
-
-(ert-deftest zhihu-pin-text-length-matches-web-builder ()
-  (should (= (zhihu--pin-html-text-length "<p>A😀&amp;B</p>") 8))
-  (let ((content
-         (zhihu--pin-content-from-html
-          "<p>A😀</p>"
-          "/tmp/")))
-    (should (= (plist-get content :text-length) 2)))
-  (should-error
-   (zhihu--pin-content-from-html
-    (concat "<p>" (make-string 2001 ?a) "</p>")
-    "/tmp/")))
-
 (ert-deftest zhihu-publish-bodies-separate-answer-and-article-fields ()
   (let* ((answer-body
           (zhihu-test--publish-answer-body
@@ -5647,144 +3758,6 @@ other: keep\n---\nBody\n"
     (should (eq (plist-get article-draft :isPublished) t))
     (should-not (plist-member article-extra :question_id))
     (should-not (plist-member article-data :hybrid))))
-
-(ert-deftest zhihu-publish-pin-builds-new-and-update-payloads ()
-  (let* ((content
-          '(:html "<p>想法</p>"
-		  :text-length 2
-		  :medias
-		  [(:image
-		    (:height 80 :width 100
-			     :url "https://picx.zhimg.com/image.png"
-			     :originalUrl "https://picx.zhimg.com/image.png"))]))
-         (topics
-          [(:topic_id "123" :topic_name "#Emacs#")])
-         (new
-          (zhihu-test--publish-pin-body
-           nil "标题" content topics
-           :comment-permission "follower_n_days"
-           :trace-id "1700000000000,uuid"))
-         (update
-          (zhihu-test--publish-pin-body
-           "456" nil content []
-           :trace-id "1700000000001,uuid"))
-         (new-data (plist-get new :data))
-         (new-draft (plist-get new-data :draft))
-         (update-data (plist-get update :data))
-         (update-draft (plist-get update-data :draft)))
-    (should (equal (plist-get new :action) "pin"))
-    (should (equal new-draft '(:disabled 1)))
-    (should-not (plist-member new-draft :id))
-    (should-not (plist-member new-draft :isPublished))
-    (should
-     (equal
-      (plist-get (plist-get new-data :publish) :traceId)
-      "1700000000000,uuid"))
-    (should
-     (equal
-      (plist-get
-       (plist-get new-data :commentsPermission)
-       :comment_permission)
-      "follower_n_days"))
-    (should
-     (equal (plist-get (plist-get new-data :extra_info)
-                       :view_permission)
-            "all"))
-    (should
-     (equal (plist-get (plist-get new-data :extra_info) :publisher)
-            "pc"))
-    (should (equal (plist-get (plist-get new-data :title) :title)
-                   "标题"))
-    (should
-     (equal (plist-get (plist-get new-data :hybrid) :html)
-            "<p>想法</p>"))
-    (should (= (plist-get (plist-get new-data :hybrid) :textLength)
-               2))
-    (should
-     (equal (plist-get (plist-get new-data :media) :medias)
-            (plist-get content :medias)))
-    (should
-     (equal (plist-get (plist-get new-data :topic) :topics)
-            topics))
-    (dolist
-        (article-field
-         '(:reprint :creationStatement :contentsTables :hybridInfo
-		    :publishSwitch :appreciate))
-      (should-not (plist-member new-data article-field)))
-    (should (equal (plist-get update :action) "pin"))
-    (should (equal (plist-get update-draft :id) "456"))
-    (should (eq (plist-get update-draft :isPublished) t))
-    (should-not (plist-member update-data :title))
-    (should-not (plist-member update-data :topic))))
-
-(ert-deftest zhihu-publish-pin-omits-empty-conditional-sections ()
-  (let* ((content
-          '(:html "" :text-length 0
-		  :medias
-		  [(:image
-		    (:height 1 :width 1
-			     :url "https://picx.zhimg.com/image.png"
-			     :originalUrl "https://picx.zhimg.com/image.png"))]))
-         (body
-          (zhihu-test--publish-pin-body
-           nil nil content [] :trace-id "trace"))
-         (data (plist-get body :data)))
-    (should-not (plist-member data :title))
-    (should-not (plist-member data :hybrid))
-    (should-not (plist-member data :topic))
-    (should (plist-member data :media)))
-  (let* ((body
-          (zhihu-test--publish-pin-body
-           nil nil
-           '(:html
-             "<p><img eeimg=\"1\" src=\"//www.zhihu.com/equation?tex=x\"></p>"
-             :text-length 0
-             :medias
-             [(:image
-               (:height 1 :width 1
-			:url "https://picx.zhimg.com/image.png"
-			:originalUrl "https://picx.zhimg.com/image.png"))])
-           []
-           :trace-id "trace"))
-         (data (plist-get body :data)))
-    (should (plist-member data :hybrid))
-    (should (plist-member data :media)))
-  (should-error
-   (zhihu-test--publish-pin-body
-    nil nil
-    '(:html
-      "<p><img eeimg=\"1\" src=\"//www.zhihu.com/equation?tex=x\"></p>"
-      :text-length 0
-      :medias [])
-    []
-    :trace-id "trace"))
-  (should-error
-   (zhihu-test--publish-pin-body
-    nil nil
-    '(:html "" :text-length 0 :medias [])
-    []
-    :trace-id "trace"))
-  (should
-   (equal
-    (zhihu--normalize-pin-title (make-string 50 #x1f600))
-    (make-string 50 #x1f600)))
-  (should-error
-   (zhihu-test--publish-pin-body
-    nil (make-string 51 #x1f600)
-    '(:html "<p>x</p>" :text-length 1 :medias [])
-    []
-    :trace-id "trace")))
-
-(ert-deftest zhihu-pin-topic-data-resolves-name-and-id ()
-  (cl-letf
-      (((symbol-function 'zhihu--resolve-article-topic)
-        (lambda (name)
-          (should (equal name "Emacs"))
-          '(:id 123 :name "Emacs"))))
-    (should
-     (equal
-      (zhihu--pin-topic-data '("Emacs"))
-      [(:topic_id "123" :topic_name "#Emacs#")]))))
 
 (ert-deftest zhihu-publish-default-options-feed-payload ()
   (let ((zhihu-publish-defaults
@@ -6013,21 +3986,6 @@ other: keep\n---\nBody\n"
              (zhihu--publish-answer "456" "123" "<p>new</p>")
              "456"))))
 
-(ert-deftest zhihu-publish-request-accepts-pin-result-id ()
-  (dolist
-      (result
-       '((:id 456)
-         "{\"id\":\"789\"}"))
-    (cl-letf (((symbol-function 'zhihu--http-json)
-               (lambda (&rest _args)
-                 `(:status 200
-			   :json (:code 0 :data (:result ,result))
-			   :body "{\"code\":0}"))))
-      (should
-       (equal
-        (zhihu--publish-request '(:action "pin" :data nil))
-        (if (listp result) "456" "789"))))))
-
 (ert-deftest zhihu-publish-request-combines-unconfirmed-response-errors ()
   (dolist
       (case
@@ -6081,62 +4039,6 @@ other: keep\n---\nBody\n"
                (ert-fail "Missing article-id must fail before publishing"))))
     (should-error (zhihu--publish-article nil t))))
 
-(ert-deftest zhihu-checkpoint-meta-writes-then-refreshes ()
-  (let* ((file (make-temp-file "zhihu-checkpoint-" nil ".md" "old"))
-         (meta '(:kind answer :question-id "123"))
-         (buffer (find-file-noselect file)))
-    (unwind-protect
-        (progn
-          (cl-letf (((symbol-function 'zhihu--write-zhihu-meta)
-                     (lambda (written-file written-meta)
-                       (should (equal written-file file))
-                       (should (equal written-meta meta))
-                       (with-temp-file written-file
-                         (insert "new")))))
-            (zhihu--checkpoint-meta file meta))
-          (with-current-buffer buffer
-            (should (equal (buffer-string) "new"))))
-      (when (buffer-live-p buffer)
-        (kill-buffer buffer))
-      (delete-file file))))
-
-(ert-deftest zhihu-existing-answer-publishes-without-metadata-write ()
-  (cl-letf (((symbol-function 'zhihu--source-to-html)
-             (lambda (_file) "<p>new</p>"))
-            ((symbol-function 'zhihu--rewrite-img-srcs)
-             (lambda (html _base-dir source)
-               (should (equal source "answer"))
-               html))
-            ((symbol-function 'zhihu--checkpoint-meta)
-             (lambda (&rest _args)
-               (ert-fail "Existing answer metadata did not change")))
-            ((symbol-function 'zhihu--publish-answer)
-             (lambda (answer-id question-id html &rest args)
-               (should (equal answer-id "456"))
-               (should (equal question-id "123"))
-               (should (equal html "<p>new</p>"))
-               (should
-                (equal (plist-get args :creation-statement) "spoiler"))
-               (should
-                (equal (plist-get args :content-source) "newsReport"))
-               (should
-                (equal (plist-get args :reprint-permission) "disallowed"))
-               (should
-                (equal (plist-get args :comment-permission) "followee"))
-               answer-id)))
-    (should
-     (equal
-      (zhihu--publish-answer-file
-       "/tmp/existing-answer.md"
-       (list :kind 'answer
-             :question-id "123"
-             :answer-id "456"
-             :creation-statement "spoiler"
-             :content-source "newsReport"
-             :reprint-permission "disallowed"
-             :comment-permission "followee"))
-      "456"))))
-
 (ert-deftest zhihu-package-publish-content-separates-only-type-policy ()
   (let ((html "<p>Shared HTML</p>")
         calls)
@@ -6150,13 +4052,7 @@ other: keep\n---\nBody\n"
          ((symbol-function 'zhihu--append-article-cc-statement)
           (lambda (actual-html)
             (push (list 'cc actual-html) calls)
-            (concat actual-html ":cc")))
-         ((symbol-function 'zhihu--pin-content-from-html)
-          (lambda (actual-html base-dir)
-            (should (equal actual-html html))
-            (should (equal base-dir "/tmp/"))
-            (push '(pin) calls)
-            `(:html ,actual-html :text-length 11 :medias []))))
+            (concat actual-html ":cc"))))
       (should
        (equal
         (zhihu--package-publish-content
@@ -6167,11 +4063,6 @@ other: keep\n---\nBody\n"
         (zhihu--package-publish-content
          'article html "/tmp/")
         '(:html "article:<p>Shared HTML</p>:cc")))
-      (should
-       (equal
-        (zhihu--package-publish-content
-         'pin html "/tmp/")
-        '(:html "<p>Shared HTML</p>" :text-length 11 :medias [])))
       (should-error
        (zhihu--package-publish-content
         'unknown html "/tmp/")))
@@ -6180,8 +4071,7 @@ other: keep\n---\nBody\n"
       (nreverse calls)
       '((rewrite "answer")
         (rewrite "article")
-        (cc "article:<p>Shared HTML</p>")
-        (pin))))))
+        (cc "article:<p>Shared HTML</p>"))))))
 
 (ert-deftest zhihu-inline-images-degrade-to-alt-and-block-images-remain ()
   (let* ((html
@@ -6201,8 +4091,11 @@ other: keep\n---\nBody\n"
            (concat "<html><body>" converted "</body></html>")))
          (body (car (dom-by-tag dom 'body)))
          (images (dom-by-tag body 'img))
-         (ordinary (cl-remove-if #'zhihu--pin-equation-image-p images))
-         (equations (cl-remove-if-not #'zhihu--pin-equation-image-p images))
+         (equation-p
+          (lambda (image)
+            (member (dom-attr image 'eeimg) '("1" "2"))))
+         (ordinary (cl-remove-if equation-p images))
+         (equations (cl-remove-if-not equation-p images))
          (anchor (car (dom-by-tag body 'a))))
     (should
      (equal
@@ -6214,566 +4107,347 @@ other: keep\n---\nBody\n"
     (should (string-match-p "公式继续" (dom-inner-text body)))
     (should (string-match-p "顶层文字" (dom-inner-text body)))))
 
-(ert-deftest zhihu-new-answer-checkpoints-only-the-new-id ()
-  (let (checkpoints)
-    (cl-letf (((symbol-function 'zhihu--source-to-html)
-               (lambda (_file) "<p>new</p>"))
-              ((symbol-function 'zhihu--rewrite-img-srcs)
-               (lambda (html _base-dir _source) html))
-              ((symbol-function 'zhihu--checkpoint-meta)
-               (lambda (_file meta)
-                 (push (list (plist-get meta :question-id)
-                             (plist-get meta :answer-id))
-                       checkpoints)))
-              ((symbol-function 'zhihu--publish-answer)
-               (lambda (answer-id question-id html &rest args)
-                 (should-not answer-id)
-                 (should (equal question-id "123"))
-                 (should (equal html "<p>new</p>"))
-                 (should-not (plist-get args :creation-statement))
-                 (should-not (plist-get args :reprint-permission))
-                 (should-not (plist-get args :comment-permission))
-                 "789")))
-      (zhihu--publish-answer-file
-       "/tmp/new-answer.md"
-       (list :kind 'answer
-             :question-id "123"
-             :answer-id nil)))
-    (setq checkpoints (nreverse checkpoints))
-    (should (equal checkpoints '(("123" "789"))))))
+(ert-deftest zhihu-org-mermaid-source-block-renders-png-image nil
+  (let (source)
+    (cl-letf
+	(((symbol-function 'zhihu--render-mermaid-png)
+	  (lambda (input) (setq source input) zhihu-test--mermaid-png)))
+      (let*
+	  ((html
+	    (zhihu--org->html
+	     (concat "#+begin_src mermaid\n" "flowchart LR\n"
+		     "  A --> B\n" "#+end_src\n")))
+	   (dom
+	    (zhihu--parse-html
+	     (concat "<html><body>" html "</body></html>")))
+	   (image (car (dom-by-tag dom 'img))))
+	(should (equal source "flowchart LR\n  A --> B\n"))
+	(should image) (should-not (dom-by-tag dom 'pre))
+	(should (equal (dom-attr image 'alt) "Mermaid diagram"))
+	(let
+	    ((decoded (zhihu--decode-data-url (dom-attr image 'src))))
+	  (should (equal (car decoded) "image/png"))
+	  (should (equal (cdr decoded) zhihu-test--mermaid-png)))))))
 
-(ert-deftest zhihu-pin-file-checkpoints-only-the-new-id ()
-  (dolist (initial-id '(nil "456"))
-    (let (checkpoints)
-      (cl-letf
-          (((symbol-function 'zhihu--source-to-html)
-            (lambda (_file) "<p>new</p><p><img src=\"image.png\"></p>"))
-           ((symbol-function 'zhihu--pin-topic-data)
-            (lambda (topics)
-              (should (equal topics '("Emacs")))
-              [(:topic_id "1" :topic_name "#Emacs#")]))
-           ((symbol-function 'zhihu--pin-content-from-html)
-            (lambda (html base-dir)
-              (should
-               (equal html "<p>new</p><p><img src=\"image.png\"></p>"))
-              (should (equal base-dir "/tmp/"))
-              '(:html "<p>new</p>"
-                      :text-length 3
-                      :medias
-                      [(:image
-			(:height 1 :width 1
-				 :url "https://picx.zhimg.com/uploaded.png"
-				 :originalUrl
-				 "https://picx.zhimg.com/uploaded.png"))])))
-           ((symbol-function 'zhihu--checkpoint-meta)
-            (lambda (_file meta)
-              (push
-               (list
-                (and (plist-member meta :thought-id) t)
-                (plist-get meta :thought-id))
-               checkpoints)))
-           ((symbol-function 'zhihu--publish-pin)
-            (lambda (thought-id title content topics &rest options)
-              (should (equal thought-id initial-id))
-              (should (equal title "Title"))
-              (should (= (plist-get content :text-length) 3))
-              (should (= (length topics) 1))
-              (should
-               (equal
-                (plist-get options :comment-permission)
-                "follower_n_days"))
-              (or thought-id "789")))
-           ((symbol-function 'zhihu--rewrite-img-srcs)
-            (lambda (&rest _args)
-              (ert-fail "Pin must not use article/answer image rewriting")))
-           ((symbol-function 'zhihu--append-article-cc-statement)
-            (lambda (&rest _args)
-              (ert-fail "Pin must not append the article CC statement"))))
-        (should
-         (equal
-          (zhihu--publish-pin-file
-           "/tmp/pin.md"
-           (list :kind 'pin
-                 :thought-id initial-id
-                 :title "Title"
-                 :topics '("Emacs")
-                 :comment-permission "follower_n_days"))
-          (or initial-id "789"))))
-      (setq checkpoints (nreverse checkpoints))
-      (should
-       (equal
-        (if initial-id
-            nil
-          '((t "789")))
-        checkpoints)))))
+(ert-deftest zhihu-org-inline-footnote-uses-native-reference nil
+  (let*
+      ((html (zhihu--org->html "正文[fn::纯文字说明]。\n"))
+       (reference (car (zhihu-test--references html))))
+    (zhihu-test--assert-reference reference 1 "纯文字说明" "")))
 
-(ert-deftest zhihu-article-banner-uploads-and-patches-draft ()
-  (let* ((directory (make-temp-file "zhihu-test-banner-" t))
-         (article-file (expand-file-name "article.md" directory))
-         (banner-path "./images/banner.png")
-         (banner-file (expand-file-name banner-path directory))
-         (banner-url "https://picx.zhimg.com/banner.png"))
-    (unwind-protect
-        (progn
-          (make-directory (file-name-directory banner-file))
-          (with-temp-file banner-file
-            (insert "banner bytes"))
-          (let ((bytes (zhihu--read-file-bytes banner-file))
-                (uploads 0)
-                patch-body)
-            (cl-letf
-                (((symbol-function 'zhihu--source-to-html)
-                  (lambda (_file) "<p>body</p>"))
-                 ((symbol-function 'zhihu--rewrite-img-srcs)
-                  (lambda (html _base-dir source)
-                    (should (equal source "article"))
-                    html))
-                 ((symbol-function 'zhihu--upload-bytes)
-                  (lambda (uploaded mime source)
-                    (cl-incf uploads)
-                    (should (equal uploaded bytes))
-                    (should (equal mime "image/png"))
-                    (should (equal source "article"))
-                    banner-url))
-                 ((symbol-function 'zhihu--checkpoint-meta)
-                  (lambda (&rest _args)
-                    (ert-fail "Existing published article state did not change")))
-                 ((symbol-function 'zhihu--http-json)
-                  (lambda (method _url &rest args)
-                    (should (equal method "PATCH"))
-                    (setq patch-body (plist-get args :body))
-                    '(:status 200 :json nil :body "")))
-                 ((symbol-function 'zhihu--sync-article-topics)
-                  (lambda (state article-id topics)
-                    (should (zhihu--xsrf-state-p state))
-                    (should (equal article-id "456"))
-                    (should-not topics)))
-                 ((symbol-function 'zhihu--publish-article)
-                  (lambda (article-id is-published &rest _args)
-                    (should (equal article-id "456"))
-                    (should is-published)
-                    article-id)))
-              (should
-               (equal
-                (zhihu--publish-article-file
-                 (zhihu--make-xsrf-state "token")
-                 article-file
-                 (list :kind 'article
-                       :title "Title"
-                       :article-id "456"
-                       :banner banner-path))
-                "456")))
-            (should (= uploads 1))
-            (should
-             (equal (plist-get patch-body :titleImage) banner-url))
-            (should
-             (eq
-              (plist-get patch-body :isTitleImageFullScreen)
-              :json-false))))
-      (delete-directory directory t))))
+(ert-deftest zhihu-org-math-uses-native-equation-images nil
+  (let* ((html (zhihu--org->html "行内 $x<y$，展示 \\[z^2\\]。\n"))
+         (dom
+	  (zhihu--parse-html
+	   (concat "<html><body>" html "</body></html>")))
+         (images (dom-by-tag dom 'img)))
+    (should (= (length images) 2))
+    (should (equal (dom-attr (nth 0 images) 'eeimg) "1"))
+    (should (equal (dom-attr (nth 0 images) 'alt) "x<y"))
+    (should (equal (dom-attr (nth 1 images) 'eeimg) "2"))
+    (should (equal (dom-attr (nth 1 images) 'alt) "z^2"))
+    (should (string-match-p "，展示 " html))))
 
-(ert-deftest zhihu-article-banner-rejects-nonlocal-sources ()
+(ert-deftest zhihu-org-latex-environment-is-a-display-equation nil
+  (let* ((html
+	  (zhihu--org->html
+	   "\\begin{equation}\nx^2 = y\n\\end{equation}\n"))
+	 (dom
+	  (zhihu--parse-html
+	   (concat "<html><body>" html "</body></html>")))
+	 (body (car (dom-by-tag dom 'body)))
+	 (elements (cl-remove-if-not #'consp (dom-children body)))
+	 (image (car (dom-by-tag body 'img))))
+    (should (equal (mapcar #'dom-tag elements) '(p)))
+    (should (equal (dom-attr image 'eeimg) "2"))
+    (should
+     (equal
+      (url-unhex-string
+       (cadr (split-string (dom-attr image 'src) "tex=")))
+      "\\begin{equation} x^2 = y \\end{equation}"))
+    (should (string-match-p "x\\^2 = y" (dom-attr image 'alt)))))
+
+(ert-deftest zhihu-org-export-never-executes-babel nil
+  (let (executed)
+    (cl-letf
+	(((symbol-function 'org-babel-execute-src-block)
+	  (lambda (&rest _args) (setq executed t) "unsafe")))
+      (let ((html
+	     (zhihu--org->html
+	      "#+begin_src emacs-lisp :exports results\n(error \"unsafe\")\n#+end_src\n")))
+	(should-not executed)
+	(should (string-match-p "unsafe" html))))))
+
+(ert-deftest zhihu-org-rejects-empty-and-duplicate-keywords nil
   (dolist
-      (banner
-       '("https://example.com/banner.png"
-         "//example.com/banner.png"
-         "data:image/png;base64,Y292ZXI="))
-    (cl-letf (((symbol-function 'zhihu--source-to-html)
-               (lambda (_file) "<p>body</p>"))
-              ((symbol-function 'zhihu--rewrite-img-srcs)
-               (lambda (html _base-dir _source) html)))
-      (should-error
-       (zhihu--publish-article-file
-        (zhihu--make-xsrf-state "token")
-        "/tmp/article.md"
-        (list :kind 'article
-              :title "Title"
-              :article-id "456"
-              :banner banner))))))
+      (source
+       '("#+TITLE: Test\n#+ZHIHU_QUESTION_ID:\n"
+	 "#+TITLE: Test\n#+ZHIHU_QUESTION_ID:   \n"
+	 "#+TITLE: Test\n#+ZHIHU_QUESTION_ID: 123\n#+ZHIHU_QUESTION_ID: 456\n"
+	 "#+TITLE: Test\n#+ZHIHU_QUESTION_ID: 123\n#+zhihu_question_id: 456\n"))
+    (zhihu-test--with-temp-file ".org" source
+				(lambda (file)
+				  (should-error
+				   (zhihu--org-read-meta file))))))
 
-(ert-deftest zhihu-article-one-command-publish-rewrites-links-after-id-known ()
-  (dolist (initial-id '(nil "456"))
-    (let* ((zhihu-article-cc-statement nil)
-           (source-html
-            (concat
-             "<h2 id=\"start\">Start</h2>"
-             "<p><a href=\"#finish\">Finish</a></p>"
-             "<h3 id=\"finish\">Finish</h3>"))
-           (final-id (or initial-id "789"))
-           (xsrf-state (zhihu--make-xsrf-state "token"))
-           created-content
-           patched-content
-           checkpoints
-           events)
-      (cl-letf
-          (((symbol-function 'zhihu--source-to-html)
-            (lambda (file)
-              (should (equal file "/tmp/article.md"))
-              source-html))
-           ((symbol-function 'zhihu--rewrite-img-srcs)
-            (lambda (html base-dir source)
-              (should (equal html source-html))
-              (should (equal base-dir "/tmp/"))
-              (should (equal source "article"))
-              html))
-           ((symbol-function 'zhihu--create-article-draft)
-            (lambda (state title html)
-              (when initial-id
-                (ert-fail "Existing article must not create a new draft"))
-              (push 'create events)
-              (should (eq state xsrf-state))
-              (should (equal title "Title"))
-              (setq created-content html)
-              "789"))
-           ((symbol-function 'zhihu--checkpoint-meta)
-            (lambda (file meta)
-              (should (equal file "/tmp/article.md"))
-              (push (plist-get meta :article-id) checkpoints)))
-           ((symbol-function 'zhihu--zhuanlan-mutation-request)
-            (lambda (state method url referer &rest args)
-              (push 'patch events)
-              (should (eq state xsrf-state))
-              (should (equal method "PATCH"))
-              (should
-               (equal
-                url
-                (format
-                 "https://zhuanlan.zhihu.com/api/articles/%s/draft"
-                 final-id)))
-              (should
-               (equal
-                referer
-                (format
-                 "https://zhuanlan.zhihu.com/p/%s/edit"
-                 final-id)))
-              (let ((body (plist-get args :body)))
-                (setq patched-content (plist-get body :content))
-                (should (eq (plist-get body :table_of_contents) t)))
-              '(:status 200 :json nil :body "")))
-           ((symbol-function 'zhihu--sync-article-topics)
-            (lambda (state article-id topics)
-              (push 'sync events)
-              (should (eq state xsrf-state))
-              (should (equal article-id final-id))
-              (should-not topics)))
-           ((symbol-function 'zhihu--publish-article)
-            (lambda (article-id is-published &rest options)
-              (push 'publish events)
-              (should (equal article-id final-id))
-              (should (eq is-published (and initial-id t)))
-              (should (eq (plist-get options :xsrf-state) xsrf-state))
-              (should (eq
-                       (plist-get options :toc)
-                       t))
-              article-id)))
-        (should
-         (equal
-          (zhihu--publish-article-file
-           xsrf-state
-           "/tmp/article.md"
-           (list :kind 'article
-                 :title "Title"
-                 :article-id initial-id
-                 :toc t))
-          final-id)))
-      (when created-content
-        (should
-         (equal
-          (dom-attr (zhihu-test--only-anchor created-content) 'href)
-          "#finish")))
-      (should
-       (equal
-        (dom-attr (zhihu-test--only-anchor patched-content) 'href)
-        (format "#h_%s_1" final-id)))
-      (should
-       (equal
-        (nreverse events)
-        (if initial-id
-            '(patch sync publish)
-          '(create patch sync publish))))
-      (should
-       (equal
-        (nreverse checkpoints)
-        (if initial-id
-            nil
-          '("789")))))))
+(ert-deftest zhihu-org-banner-is-generic-only-and-strict nil
+  (zhihu-test--with-temp-file ".org"
+			      (concat "#+TITLE: Test\n"
+				      "#+BANNER: ./canonical.jpg\n"
+				      "#+ZHIHU_QUESTION_ID: 123\n"
+				      "#+ZHIHU_BANNER: ./ignored.jpg\n")
+			      (lambda (file)
+				(let
+				    ((meta (zhihu--org-read-meta file)))
+				  (should
+				   (eq (plist-get meta :kind) 'answer))
+				  (should
+				   (equal (plist-get meta :banner)
+					  "./canonical.jpg")))))
+  (zhihu-test--with-temp-file ".org"
+			      "#+TITLE: Test\n#+ZHIHU_BANNER: ./ignored.jpg\n#+ZHIHU_ARTICLE_ID:\n"
+			      (lambda (file)
+				(should-not
+				 (plist-get
+				  (zhihu--org-read-meta file) :banner))))
+  (dolist
+      (source
+       '("#+TITLE: Test\n#+ZHIHU_ARTICLE_ID:\n#+BANNER:\n"
+	 "#+TITLE: Test\n#+ZHIHU_ARTICLE_ID:\n#+BANNER: one\n#+banner: two\n"))
+    (zhihu-test--with-temp-file ".org" source
+				(lambda (file)
+				  (should-error
+				   (zhihu--org-read-meta file))))))
 
-(ert-deftest zhihu-article-section-link-preflight-precedes-all-side-effects ()
-  (let ((source-html
-         (concat
-          "<h2 id=\"target\">Target</h2>"
-          "<p><a href=\"#target\">Target</a>"
-          "<img src=\"body.png\"></p>")))
-    (cl-letf
-        (((symbol-function 'zhihu--source-to-html)
-          (lambda (_file) source-html))
-         ((symbol-function 'zhihu--rewrite-img-srcs)
-          (lambda (&rest _args)
-            (ert-fail "Body image upload must follow section-link preflight")))
-         ((symbol-function 'zhihu--img-bytes-and-mime)
-          (lambda (&rest _args)
-            (ert-fail "Banner read must follow section-link preflight")))
-         ((symbol-function 'zhihu--upload-bytes)
-          (lambda (&rest _args)
-            (ert-fail "Banner upload must follow section-link preflight")))
-         ((symbol-function 'zhihu--create-article-draft)
-          (lambda (&rest _args)
-            (ert-fail "Draft creation must follow section-link preflight")))
-         ((symbol-function 'zhihu--zhuanlan-mutation-request)
-          (lambda (&rest _args)
-            (ert-fail "Draft PATCH must follow section-link preflight")))
-         ((symbol-function 'zhihu--sync-article-topics)
-          (lambda (&rest _args)
-            (ert-fail "Topic sync must follow section-link preflight")))
-         ((symbol-function 'zhihu--publish-article)
-          (lambda (&rest _args)
-            (ert-fail "Publish must follow section-link preflight")))
-         ((symbol-function 'zhihu--checkpoint-meta)
-          (lambda (&rest _args)
-            (ert-fail "Metadata writes must follow section-link preflight")))
-         ((symbol-function 'zhihu--http-json)
-          (lambda (&rest _args)
-            (ert-fail "HTTP must follow section-link preflight")))
-         ((symbol-function 'zhihu--http)
-          (lambda (&rest _args)
-            (ert-fail "HTTP must follow section-link preflight"))))
-      (let ((err
-             (should-error
-              (zhihu--publish-article-file
-               (zhihu--make-xsrf-state "token")
-               "/tmp/article.md"
-               (list :kind 'article
-                     :title "Title"
-                     :article-id nil
-                     :banner "./cover.png"
-                     :toc nil))
-              :type 'user-error)))
-        (should
-         (string-match-p
-          (regexp-quote "目录")
-          (error-message-string err)))))))
+(ert-deftest zhihu-org-native-toc-is-strict-and-channel-independent
+    nil
+  (dolist
+      (value '("headlines" "headlines 1" "HEADLINES 2" "headlines 3"))
+    (zhihu-test--with-temp-file ".org"
+				(format
+				 "#+TITLE: Test\n#+TOC: %s\n#+ZHIHU_ARTICLE_ID:\n"
+				 value)
+				(lambda (file)
+				  (should
+				   (plist-get
+				    (zhihu--org-read-meta file) :toc)))))
+  (zhihu-test--with-temp-file ".org"
+			      "#+TITLE: Test\n#+TOC: headlines 2\n#+ZHIHU_QUESTION_ID: 123\n"
+			      (lambda (file)
+				(let
+				    ((meta (zhihu--org-read-meta file)))
+				  (should
+				   (eq (plist-get meta :kind) 'answer))
+				  (should (plist-get meta :toc)))))
+  (dolist
+      (source
+       '("#+TITLE: Test\n#+TOC:\n#+ZHIHU_ARTICLE_ID:\n"
+	 "#+TITLE: Test\n#+TOC: headlines 0\n#+ZHIHU_ARTICLE_ID:\n"
+	 "#+TITLE: Test\n#+TOC: headlines 4\n#+ZHIHU_ARTICLE_ID:\n"
+	 "#+TITLE: Test\n#+TOC: contents\n#+ZHIHU_ARTICLE_ID:\n"
+	 "#+TITLE: Test\n#+TOC: headlines 1 2\n#+ZHIHU_ARTICLE_ID:\n"
+	 "#+TITLE: Test\n#+TOC: headlines 1\n#+toc: headlines 2\n#+ZHIHU_ARTICLE_ID:\n"))
+    (zhihu-test--with-temp-file ".org" source
+				(lambda (file)
+				  (should-error
+				   (zhihu--org-read-meta file))))))
 
-(ert-deftest zhihu-article-checkpoints-required-state-transitions ()
-  (dolist (case
-	   '((:article-id "456"
-			  :toc nil
-			  :checkpoints nil)
-	     (:article-id nil
-			  :toc t
-			  :checkpoints ((t "789")))))
-    (let* ((zhihu-article-cc-statement 'by-nc-sa)
-           (expected-html
-            (zhihu--append-article-cc-statement "<p>new</p>"))
-	   (initial-id (plist-get case :article-id))
-           (toc
-            (plist-get case :toc))
-           (expected-checkpoints (plist-get case :checkpoints))
-           (final-id (or initial-id "789"))
-           (topics '("A" "B"))
-           (xsrf-state (zhihu--make-xsrf-state "token"))
-           (draft-creations 0)
-           (patch-requests 0)
-           events
-           checkpoints)
-      (cl-letf
-          (((symbol-function 'zhihu--source-to-html)
-            (lambda (_file) "<p>new</p>"))
-           ((symbol-function 'zhihu--rewrite-img-srcs)
-            (lambda (html _base-dir source)
-              (should (equal source "article"))
-              html))
-           ((symbol-function 'zhihu--checkpoint-meta)
-            (lambda (_file meta)
-              (should
-               (equal (plist-get meta :creation-statement) "contain_finance"))
-              (should
-               (equal (plist-get meta :content-source) "printMedia"))
-              (should
-               (eq (plist-get meta :toc)
-                   toc))
-              (should
-               (equal
-                (plist-get meta :reprint-permission) "need_payment"))
-              (should
-               (equal (plist-get meta :comment-permission) "nobody"))
-	      (push (list (and (plist-member meta :article-id) t)
-			  (plist-get meta :article-id))
-                    checkpoints)))
-           ((symbol-function 'zhihu--create-article-draft)
-            (lambda (state title html)
-              (should (eq state xsrf-state))
-              (should (equal title "Title"))
-              (should (equal html expected-html))
-              (cl-incf draft-creations)
-              "789"))
-           ((symbol-function 'zhihu--zhuanlan-mutation-request)
-            (lambda (state method url referer &rest args)
-              (push 'patch events)
-              (cl-incf patch-requests)
-              (should (eq state xsrf-state))
-              (should (equal method "PATCH"))
-              (should
-               (equal
-                url
-                (format
-                 "https://zhuanlan.zhihu.com/api/articles/%s/draft"
-                 final-id)))
-              (should
-               (equal
-                referer
-                (format
-                 "https://zhuanlan.zhihu.com/p/%s/edit"
-                 final-id)))
-              (let ((body (plist-get args :body)))
-                (should (equal (plist-get body :title) "Title"))
-                (should (equal (plist-get body :content) expected-html))
-                (should (plist-member body :titleImage))
-                (should (equal (plist-get body :titleImage) ""))
-                (should (plist-member body :isTitleImageFullScreen))
-                (should
-                 (eq (plist-get body :isTitleImageFullScreen) :json-false))
-                (should
-                 (eq
-                  (plist-get body :table_of_contents)
-                  (if toc t :json-false))))
-              '(:status 200 :json nil :body "")))
-           ((symbol-function 'zhihu--sync-article-topics)
-            (lambda (state article-id actual-topics)
-              (push 'sync events)
-              (should (eq state xsrf-state))
-              (should (equal article-id final-id))
-              (should (equal actual-topics topics))))
-           ((symbol-function 'zhihu--publish-article)
-            (lambda (article-id is-published &rest args)
-              (push 'publish events)
-              (should (eq (plist-get args :xsrf-state) xsrf-state))
-              (should (equal article-id final-id))
-              (should (eq is-published (and initial-id t)))
-              (should
-               (equal (plist-get args :creation-statement) "contain_finance"))
-              (should
-               (equal (plist-get args :content-source) "printMedia"))
-              (should
-               (eq (plist-get args :toc)
-                   toc))
-              (should
-               (equal
-                (plist-get args :reprint-permission) "need_payment"))
-              (should
-               (equal (plist-get args :comment-permission) "nobody"))
-              article-id)))
-	(let ((meta
-	       (list :kind 'article
-		     :title "Title"
-		     :creation-statement "contain_finance"
-		     :content-source "printMedia"
-		     :toc toc
-		     :reprint-permission "need_payment"
-		     :comment-permission "nobody"
-		     :topics topics)))
-	  (setq meta (plist-put meta :article-id initial-id))
-	  (zhihu--publish-article-file
-	   xsrf-state "/tmp/article.md" meta)))
-      (should (= draft-creations (if initial-id 0 1)))
-      (should (= patch-requests 1))
-      (should (equal (nreverse events) '(patch sync publish)))
-      (setq checkpoints (nreverse checkpoints))
-      (should
-       (equal
-	checkpoints
-        expected-checkpoints)))))
+(ert-deftest zhihu-org-ignores-keywords-in-source-blocks nil
+  (zhihu-test--with-temp-file ".org"
+			      (concat "#+TITLE: Test\n"
+				      "#+ZHIHU_ARTICLE_ID:\n"
+				      "#+begin_src org\n"
+				      "#+BANNER:\n"
+				      "#+BANNER: ./inside-source-block.jpg\n"
+				      "#+TOC: headlines 2\n"
+				      "#+ZHIHU_QUESTION_ID:\n"
+				      "#+ZHIHU_QUESTION_ID: 123\n"
+				      "#+end_src\n")
+			      (lambda (file)
+				(let
+				    ((meta (zhihu--org-read-meta file)))
+				  (should
+				   (eq (plist-get meta :kind) 'article))
+				  (should-not (plist-get meta :banner))
+				  (should-not (plist-get meta :toc))
+				  (should-not
+				   (plist-get meta :question-id))))))
 
-(ert-deftest zhihu-article-column-errors-retain-column-without-checkpoint ()
-  (dolist (phase '(query add))
-    (let ((state (zhihu--make-xsrf-state "token"))
-          published
-          add-called)
-      (cl-letf
-          (((symbol-function 'zhihu--source-to-html)
-            (lambda (_file) "<p>body</p>"))
-           ((symbol-function 'zhihu--rewrite-img-srcs)
-            (lambda (html &rest _args) html))
-           ((symbol-function 'zhihu--checkpoint-meta)
-            (lambda (&rest _args)
-              (ert-fail "Existing article must not checkpoint metadata")))
-           ((symbol-function 'zhihu--zhuanlan-mutation-request)
-            (lambda (actual-state method _url _referer &rest _args)
-              (should (eq actual-state state))
-              (should (equal method "PATCH"))
-              '(:status 200 :json nil :body "")))
-           ((symbol-function 'zhihu--sync-article-topics)
-            (lambda (&rest _args) nil))
-           ((symbol-function 'zhihu--publish-article)
-            (lambda (article-id _is-published &rest _args)
-              (setq published t)
-              article-id))
-           ((symbol-function 'zhihu--article-in-column-p)
-            (lambda (&rest _args)
-              (if (eq phase 'query)
-                  (error "查询文章专栏失败：query failed")
-                nil)))
-           ((symbol-function 'zhihu--add-article-to-column)
-            (lambda (&rest _args)
-              (setq add-called t)
-              (error "收录进专栏 writers 失败：add failed"))))
-        (let ((message
-               (condition-case err
-                   (progn
-                     (zhihu--publish-article-file
-                      state
-                      "/tmp/article.md"
-                      (list
-                       :kind 'article
-                       :title "Title"
-                       :article-id "456"
-                       :column-id "writers"))
-                     nil)
-                 (error (error-message-string err)))))
-          (should message)
+(ert-deftest zhihu-org-publish-settings-round-trip nil
+  (zhihu-test--with-temp-file ".org"
+			      (concat "#+TITLE: Test\n"
+				      "#+BANNER: ./images/cover.jpg\n"
+				      "#+TOC: headlines 2\n"
+				      "#+ZHIHU_ARTICLE_ID: 456\n"
+				      "#+ZHIHU_CREATION_STATEMENT: medical_advice\n"
+				      "#+ZHIHU_CONTENT_SOURCE: printMedia\n"
+				      "#+ZHIHU_REPRINT_PERMISSION: disallowed\n"
+				      "#+ZHIHU_COMMENT_PERMISSION: censor\n"
+				      "\n正文\n")
+			      (lambda (file)
+				(let
+				    ((meta (zhihu--org-read-meta file)))
+				  (should
+				   (equal
+				    (mapcar
+				     (lambda (key)
+				       (plist-get meta key))
+				     '(:banner :creation-statement
+					       :content-source :toc
+					       :reprint-permission
+					       :comment-permission))
+				    '("./images/cover.jpg"
+				      "medical_advice" "printMedia" t
+				      "disallowed" "censor")))
+				  (zhihu--org-write-zhihu-meta file
+							       meta)
+				  (let
+				      ((round-tripped
+					(zhihu--org-read-meta file)))
+				    (should
+				     (equal
+				      (mapcar
+				       (lambda (key)
+					 (plist-get round-tripped key))
+				       '(:banner :creation-statement
+						 :content-source :toc
+						 :reprint-permission
+						 :comment-permission))
+				      '("./images/cover.jpg"
+					"medical_advice" "printMedia"
+					t "disallowed" "censor"))))
+				  (dolist
+				      (key
+				       '(:creation-statement
+					 :content-source
+					 :reprint-permission
+					 :comment-permission))
+				    (setq meta
+					  (plist-put meta key nil)))
+				  (zhihu--org-write-zhihu-meta file
+							       meta)
+				  (let
+				      ((source
+					(with-temp-buffer
+					  (insert-file-contents file)
+					  (buffer-string))))
+				    (dolist
+					(keyword
+					 '("ZHIHU_CREATION_STATEMENT"
+					   "ZHIHU_CONTENT_SOURCE"
+					   "ZHIHU_REPRINT_PERMISSION"
+					   "ZHIHU_COMMENT_PERMISSION"))
+				      (should-not
+				       (string-match-p keyword source)))
+				    (should
+				     (string-match-p
+				      (regexp-quote
+				       "#+TOC: headlines 2")
+				      source))
+				    (should-not
+				     (string-match-p "ZHIHU_.*TOC"
+						     source))
+				    (should
+				     (string-match-p
+				      (regexp-quote
+				       "#+BANNER: ./images/cover.jpg")
+				      source)))))))
+
+(ert-deftest zhihu-org-article-topics-round-trip-and-remove nil
+  (zhihu-test--with-temp-file ".org"
+			      (concat "#+TITLE: Test\n"
+				      "#+ZHIHU_ARTICLE_ID: 456\n"
+				      "#+ZHIHU_TOPICS: [\"123\",\"comma, quote\\\"\"]\n"
+				      "#+OTHER: keep\n\n正文\n")
+			      (lambda (file)
+				(let
+				    ((meta (zhihu--org-read-meta file)))
+				  (should
+				   (equal (plist-get meta :topics)
+					  '("123" "comma, quote\"")))
+				  (zhihu--org-write-zhihu-meta file
+							       meta)
+				  (should
+				   (equal
+				    (plist-get
+				     (zhihu--org-read-meta file)
+				     :topics)
+				    '("123" "comma, quote\"")))
+				  (setq meta
+					(plist-put meta :topics nil))
+				  (zhihu--org-write-zhihu-meta file
+							       meta)
+				  (let
+				      ((source
+					(with-temp-buffer
+					  (insert-file-contents file)
+					  (buffer-string))))
+				    (should-not
+				     (string-match-p "ZHIHU_TOPICS"
+						     source))
+				    (should
+				     (string-match-p
+				      (regexp-quote "#+OTHER: keep")
+				      source))
+				    (should
+				     (string-match-p "正文" source)))))))
+
+(ert-deftest zhihu-org-rejects-invalid-article-topics nil
+  (dolist
+      (raw
+       '("[]" "null" "\"Emacs\"" "{\"name\":\"Emacs\"}"
+	 "[\"Emacs\",42]" "["))
+    (zhihu-test--with-temp-file ".org"
+				(format
+				 "#+TITLE: Test\n#+ZHIHU_ARTICLE_ID:\n#+ZHIHU_TOPICS: %s\n"
+				 raw)
+				(lambda (file)
+				  (should-error
+				   (zhihu--org-read-meta file)))))
+  (zhihu-test--with-temp-file ".org"
+			      "#+ZHIHU_ARTICLE_ID:\n#+ZHIHU_TOPICS: [\"Emacs\"]\n#+zhihu_topics: [\"Org\"]\n"
+			      (lambda (file)
+				(should-error
+				 (zhihu--org-read-meta file)))))
+
+
+(ert-deftest zhihu-interactive-mention-supports-org-and-typst ()
+  (let ((user '(:name "张三" :id "zhang-san"
+                :hash "0123456789abcdef0123456789abcdef"
+                :description "")))
+    (dolist
+        (case
+         '(("/tmp/answer.org" . "@@html:<a href=")
+           ("/tmp/answer.typ" . "#html.elem(\"a\"")))
+      (with-temp-buffer
+        (setq buffer-file-name (car case))
+        (cl-letf (((symbol-function 'zhihu--search-users)
+                   (lambda (_query) (list user)))
+                  ((symbol-function 'completing-read)
+                   (lambda (&rest _arguments) "张三 (zhang-san)")))
+          (zhihu-insert-user-mention "张三")
+          (should (string-prefix-p (cdr case) (buffer-string)))
           (should
            (string-match-p
-            (regexp-quote
-             "文章已发布为 p/456，但处理专栏 writers 失败")
-            message))
-          (should
-           (string-match-p
-            (regexp-quote
-             (if (eq phase 'query)
-                 "查询文章专栏失败"
-               "收录进专栏 writers 失败"))
-            message))
-          (should
-           (string-match-p
-            (regexp-quote
-             "column-id 已保留，再次发布即可重试")
-            message))))
-      (should published)
-      (should (eq (not (null add-called)) (eq phase 'add))))))
+            "member_mention_0123456789abcdef0123456789abcdef"
+            (buffer-string)))))))
+  (let* ((hash "0123456789abcdef0123456789abcdef")
+         (anchor
+          (zhihu-test--only-anchor
+           (zhihu--zhihuify-html
+            (format
+             (concat
+              "<a href=\"https://www.zhihu.com/people/zhang-san\" "
+              "title=\"member_mention_%s\">@张三</a>")
+             hash)))))
+    (should (equal (dom-attr anchor 'class) "member_mention"))
+    (should (equal (dom-attr anchor 'data-hash) hash))))
 
-(ert-deftest zhihu-article-topic-sync-failure-stops-publish ()
-  (let ((published nil))
-    (cl-letf
-        (((symbol-function 'zhihu--source-to-html)
-          (lambda (_file) "<p>body</p>"))
-         ((symbol-function 'zhihu--rewrite-img-srcs)
-          (lambda (html &rest _args) html))
-         ((symbol-function 'zhihu--http-json)
-          (lambda (method _url &rest _args)
-            (should (equal method "PATCH"))
-            '(:status 200 :json nil :body "")))
-         ((symbol-function 'zhihu--sync-article-topics)
-          (lambda (&rest _args) (error "topic sync failed")))
-         ((symbol-function 'zhihu--publish-article)
-          (lambda (&rest _args) (setq published t))))
-      (should-error
-       (zhihu--publish-article-file
-        (zhihu--make-xsrf-state "token")
-        "/tmp/article.md"
-        (list :kind 'article
-              :title "Title"
-              :article-id "456"
-              :topics nil))))
-    (should-not published)))
+(ert-deftest zhihu-source-formats-are-org-and-typst-only ()
+  (should (eq (zhihu--file-format "/tmp/answer.org") 'org))
+  (should (eq (zhihu--file-format "/tmp/answer.typ") 'typst))
+  (should-not (zhihu--file-format "/tmp/answer.md"))
+  (should-not (zhihu--file-format "/tmp/answer.markdown")))
 
 (provide 'zhihu-test)
 ;;; zhihu-test.el ends here

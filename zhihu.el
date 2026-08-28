@@ -5,7 +5,7 @@
 ;; Author: Dzming Li <i@dzming.li>
 ;; Maintainer: Dzming Li <i@dzming.li>
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "31.1") (markdown-mode "2.7") (plz "0.10-pre") (yaml "1.2.4"))
+;; Package-Requires: ((emacs "31.1") (plz "0.10-pre"))
 ;; Keywords: convenience, hypermedia, tools
 ;; URL: https://github.com/DzmingLi/zhihu.el
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -52,7 +52,7 @@
 
 ;;; Commentary:
 
-;; 在 Emacs 中撰写并发布知乎回答、文章和想法。
+;; 在 Emacs 中撰写并发布知乎回答和文章。
 ;;
 
 ;;; Code:
@@ -66,8 +66,8 @@
 (require 'xml)
 (require 'sqlite)
 (require 'mailcap)
-(require 'yaml)
 (require 'plz)
+(require 'ox-html)
 
 (define-error
   'zhihu-create-result-unknown
@@ -111,13 +111,7 @@ https://www.zhihu.com/creator/editor-setting 的设置项。"
           (const :tag "禁止评论" "nobody"))
   :group 'zhihu)
 
-(defcustom zhihu-enable-markdown-heading-level-shift t
-  "发布 Markdown 源稿时是否把正文标题整体下移一级。
-非 nil 时，正文一级标题输出为 HTML `h2'，为知乎页面标题保留 `h1'；
-nil 时保留源稿的自然标题层级。Typst 的 HTML 导出已经区分文档标题与
-正文标题，不受此选项影响。"
-  :type 'boolean
-  :group 'zhihu)
+
 
 (defcustom zhihu-article-cc-statement nil
   "发布文章时在正文末尾追加的 Creative Commons 声明。
@@ -1237,7 +1231,13 @@ METHOD、REFERER 和可选 BODY 直接用于本次请求。"
         result)))
    (t (error "zhihu: 不认识的 id/URL: %s" s))))
 
-(declare-function markdown-inside-link-p "markdown-mode" ())
+(declare-function org-collect-keywords "org" (keywords &optional unique directory))
+(declare-function org-element-context "org-element" (&optional element))
+(declare-function org-element-map "org-element" (data types fun &rest args))
+(declare-function org-element-parse-buffer "org-element" (&rest args))
+(declare-function org-element-property
+                  "org-element" (property node &optional dflt force-undefer))
+(declare-function org-element-type "org-element" (element))
 
 (defvar zhihu--typst-syntax-table
   (let ((table (make-syntax-table)))
@@ -1416,10 +1416,6 @@ METHOD、REFERER 和可选 BODY 直接用于本次请求。"
   '("all" "censor" "followee" "nobody")
   "稿件 `comment-permission' 可直接使用的知乎 API 值。")
 
-(defconst zhihu--pin-comment-permission-api-values
-  '("all" "censor" "follower_n_days" "followee" "nobody")
-  "想法 `comment-permission' 可直接使用的知乎 API 值。")
-
 (defun zhihu--normalize-optional-enum (field value values)
   "按 VALUES 把 metadata 的 FIELD/VALUE 归一化成字符串或 nil。"
   (cond
@@ -1466,9 +1462,6 @@ VALUE 直接使用知乎 API 类型；nil 或空字符串表示无创作声明�
 (defconst zhihu--article-topic-limit 3
   "知乎文章编辑器当前允许绑定的话题数上限。")
 
-(defconst zhihu--pin-topic-limit 10
-  "知乎想法编辑器当前允许绑定的话题数上限。")
-
 (defun zhihu--normalize-topic-name (value)
   "把 VALUE 归一化成可持久化的话题名称。"
   (unless (stringp value)
@@ -1503,12 +1496,11 @@ LIMIT 缺省为 `zhihu--article-topic-limit'；KIND-NAME 用于错误信息。"
 
 (defconst zhihu--metadata-kind-scalar-fields
   '((answer :question-id :answer-id)
-    (article :article-id :column-id)
-    (pin :thought-id))
+    (article :article-id :column-id))
   "各类稿件专属的标量 metadata 字段，按输出顺序排列。")
 
 (defconst zhihu--metadata-empty-id-slot-fields
-  '(:article-id :thought-id)
+  '(:article-id)
   "允许以空值保留、等待首次发布写回的内容 ID 字段。")
 
 (defconst zhihu--metadata-common-scalar-fields
@@ -1519,7 +1511,6 @@ LIMIT 缺省为 `zhihu--article-topic-limit'；KIND-NAME 用于错误信息。"
 (defconst zhihu--metadata-scalar-fields
   (append (cdr (assq 'answer zhihu--metadata-kind-scalar-fields))
           (cdr (assq 'article zhihu--metadata-kind-scalar-fields))
-          (cdr (assq 'pin zhihu--metadata-kind-scalar-fields))
           zhihu--metadata-common-scalar-fields)
   "全部标量 metadata 字段；用于格式适配器枚举字段。")
 
@@ -1527,18 +1518,10 @@ LIMIT 缺省为 `zhihu--article-topic-limit'；KIND-NAME 用于错误信息。"
   (append zhihu--metadata-scalar-fields '(:topics))
   "全部知乎渠道 metadata 字段；用于编辑辅助识别字段名。")
 
-(defun zhihu--reject-present-metadata-fields (z fields kind-name)
-  "若 Z 显式包含 FIELDS 中任一字段，以 KIND-NAME 报错。
-该检查按字段是否存在判断，因此显式的 false 也不会被误当成缺失。"
-  (dolist (field fields)
-    (when (plist-member z field)
-      (error "zhihu: %s不支持 %s"
-             kind-name (zhihu--metadata-field-name field)))))
-
 (defun zhihu--zhihu-meta-from-plist (z)
   "把 Z 归一化成发布流程使用的知乎渠道 metadata plist。
-数字 ID 会可靠转换为字符串。question-id、article-id 与 thought-id 必须且只能
-显式出现一个，分别表示回答、文章与想法。article-id 与 thought-id 允许保留空槽，
+数字 ID 会可靠转换为字符串。question-id 与 article-id 必须且只能
+显式出现一个，分别表示回答与文章。article-id 允许保留空槽，
 等待首次发布写回；其它未设置的字段应当缺席。"
   (when
       (or
@@ -1568,44 +1551,30 @@ LIMIT 缺省为 `zhihu--article-topic-limit'；KIND-NAME 用于错误信息。"
           (and (plist-member z :article-id) t))
          (column-id-present-p
           (and (plist-member z :column-id) t))
-         (thought-id-present-p
-          (and (plist-member z :thought-id) t))
          (identity-kinds
           (delq nil
                 (list
                  (and question-id-present-p 'answer)
-                 (and article-id-present-p 'article)
-                 (and thought-id-present-p 'pin))))
+                 (and article-id-present-p 'article))))
          (_identity-check
           (unless (= (length identity-kinds) 1)
             (error
-             "zhihu: metadata 必须且只能包含 question-id、article-id 或 thought-id 中的一个")))
+             "zhihu: metadata 必须且只能包含 question-id 或 article-id 中的一个")))
          (qid (zhihu--normalize-metadata-id-string
                "question-id" (plist-get z :question-id)))
          (aid (zhihu--normalize-metadata-id-string
                "answer-id" (plist-get z :answer-id)))
          (art (zhihu--normalize-metadata-id-string
                "article-id" (plist-get z :article-id)))
-         (thought-id (zhihu--normalize-metadata-id-string
-                      "thought-id" (plist-get z :thought-id)))
          (column
           (zhihu--normalize-metadata-string
            "column-id" (plist-get z :column-id)))
          (kind (car identity-kinds))
-         (_pin-metadata-check
-          (when (eq kind 'pin)
-            (zhihu--reject-present-metadata-fields
-             z
-             '(:creation-statement :content-source
-               :reprint-permission)
-             "想法")))
          (topics
           (zhihu--normalize-metadata-topics
            (plist-get z :topics)
-           (if (eq kind 'pin)
-               zhihu--pin-topic-limit
-             zhihu--article-topic-limit)
-           (if (eq kind 'pin) "想法" "文章")))
+           zhihu--article-topic-limit
+           "文章"))
          (creation-statement
           (zhihu--normalize-metadata-creation-statement
            (plist-get z :creation-statement)))
@@ -1621,15 +1590,13 @@ LIMIT 缺省为 `zhihu--article-topic-limit'；KIND-NAME 用于错误信息。"
           (zhihu--normalize-optional-enum
            "comment-permission"
            (plist-get z :comment-permission)
-           (if (eq kind 'pin)
-               zhihu--pin-comment-permission-api-values
-             zhihu--comment-permission-api-values))))
+           zhihu--comment-permission-api-values)))
     (when (and answer-id-present-p (not question-id-present-p))
       (error "zhihu: answer-id 必须与 question-id 一起出现"))
     (when (and column-id-present-p (not article-id-present-p))
       (error "zhihu: column-id 必须与 article-id 一起出现"))
-    (when (and topics (not (memq kind '(article pin))))
-      (error "zhihu: topics 只允许用于文章或想法"))
+    (when (and topics (not (eq kind 'article)))
+      (error "zhihu: topics 只允许用于文章"))
     (append
      (list :kind kind)
      (when question-id-present-p
@@ -1640,8 +1607,6 @@ LIMIT 缺省为 `zhihu--article-topic-limit'；KIND-NAME 用于错误信息。"
        (list :article-id art))
      (when column-id-present-p
        (list :column-id column))
-     (when thought-id-present-p
-       (list :thought-id thought-id))
      (list :topics topics
            :creation-statement creation-statement
            :content-source content-source
@@ -1664,23 +1629,21 @@ LIMIT 缺省为 `zhihu--article-topic-limit'；KIND-NAME 用于错误信息。"
 
 (defun zhihu--metadata-scalar-entries (meta)
   "从统一 META 返回应持久化的有序 (FIELD . VALUE) 标量列表。
-nil 字段会被省略，但显式存在的空 article-id/thought-id 会保留。"
+nil 字段会被省略，但显式存在的空 article-id 会保留。"
   (let* ((kind (plist-get meta :kind))
          (kind-fields
           (cdr (assq kind zhihu--metadata-kind-scalar-fields)))
          (identity-field
-          (pcase kind
+         (pcase kind
             ('answer :question-id)
-            ('article :article-id)
-            ('pin :thought-id))))
+            ('article :article-id))))
     (unless kind-fields
       (error "zhihu: 未知 metadata kind: %S" kind))
     (unless (plist-member meta identity-field)
       (error "zhihu: %s metadata 缺少 %s 字段"
              (pcase kind
                ('answer "回答")
-               ('article "文章")
-               ('pin "想法"))
+               ('article "文章"))
              (zhihu--metadata-field-name identity-field)))
     (when (and (eq kind 'answer)
                (not (plist-get meta :question-id)))
@@ -1695,9 +1658,7 @@ nil 字段会被省略，但显式存在的空 article-id/thought-id 会保留�
      for field in
      (append
       kind-fields
-     (if (eq kind 'pin)
-          '(:comment-permission)
-        zhihu--metadata-common-scalar-fields))
+     zhihu--metadata-common-scalar-fields)
      for value = (plist-get meta field)
      when (or value
               (and (memq field zhihu--metadata-empty-id-slot-fields)
@@ -1808,309 +1769,218 @@ nil 字段会被省略，但显式存在的空 article-id/thought-id 会保留�
             (insert block "\n")))))
       (write-region (point-min) (point-max) file nil 'silent))))
 
-;; Markdown YAML front matter
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+;; Org metadata
 ;;
-;; FILE 形如：
-;;   ---
-;;   title: ...
-;;   banner: "./images/banner.jpg"
-;;   zhihu:
-;;     question-id: "12345"
-;;     answer-id: "67890"
-;;   ---
-;;   正文...
-;;
-;; 读走 yaml.el；写入时只替换顶层 zhihu mapping。
+;; 标题和题图使用标准风格的 `#+TITLE:'、`#+BANNER:'；知乎渠道状态使用包自己的
+;; 关键字：
+;;   #+ZHIHU_QUESTION_ID: 123
+;;   #+ZHIHU_ANSWER_ID: 456
+;; 或：
+;;   #+ZHIHU_ARTICLE_ID: 789
+;;   #+ZHIHU_COLUMN_ID: hackers
+;; QUESTION_ID、ARTICLE_ID 与 THOUGHT_ID 必须且只能出现一个。ARTICLE_ID/THOUGHT_ID
+;; 可以保留空槽，等待首次发布写回；其它知乎关键字出现时必须有非空值。
+;; 话题是单行 JSON array。
 
-(defun zhihu--md-split-frontmatter (text)
-  "TEXT → (FRONTMATTER-STRING-OR-NIL . BODY-STRING)。
-没有 frontmatter 时第一项为 nil、第二项是原 text；未闭合时抛错。"
-  (with-temp-buffer
-    (insert text)
-    (goto-char (point-min))
-    (if (not (looking-at "---[ \t]*\n"))
-        (cons nil text)
-      (goto-char (match-end 0))
-      (let ((frontmatter-beg (point))
-            frontmatter-end
-            body-beg)
-        (while (and (not body-beg) (not (eobp)))
-          (if (looking-at "---[ \t]*$")
-              (progn
-                (setq frontmatter-end (point))
-                (forward-line 1)
-                (setq body-beg (point)))
-            (forward-line 1)))
-        (unless body-beg
-          (error "zhihu: Markdown front matter 缺少结束分隔符 ---"))
-        ;; 分隔符前的换行不属于 frontmatter；更早的空行仍保留。
-        (when (and (> frontmatter-end frontmatter-beg)
-                   (eq (char-before frontmatter-end) ?\n))
-          (setq frontmatter-end (1- frontmatter-end)))
-        (cons
-         (buffer-substring-no-properties frontmatter-beg frontmatter-end)
-         (buffer-substring-no-properties body-beg (point-max)))))))
+(defun zhihu--org-metadata-keyword (field)
+  "把 metadata 关键字 FIELD 转成对应的 Org 关键字名。"
+  (concat
+   "ZHIHU_"
+   (upcase
+    (replace-regexp-in-string
+     "-" "_" (zhihu--metadata-field-name field) t t))))
 
-(defun zhihu--md-yaml-key-regexp (key)
-  "返回匹配 YAML 普通、单引号或双引号 KEY 的 regexp。"
-  (let ((quoted (regexp-quote key)))
-    (concat "\\(?:"
-            quoted "\\|'"
-            quoted "'\\|\""
-            quoted "\"\\)")))
+(defconst zhihu--org-keyword-names
+  (mapcar #'zhihu--org-metadata-keyword
+          (append zhihu--metadata-scalar-fields
+                  '(:topics)))
+  "本包拥有的 Org 文档级关键字。")
 
-(defun zhihu--md-top-level-key-regexp (key &optional block-only)
-  "返回匹配顶层 YAML KEY 的 regexp。
-BLOCK-ONLY 非 nil 时只匹配值为空、可带行尾注释的 block mapping key。"
-  (concat "^"
-          (zhihu--md-yaml-key-regexp key)
-          "[ \t]*:"
-          (when block-only "[ \t]*\\(?:#.*\\)?\r?$")))
+(defconst zhihu--org-empty-id-keyword-names
+  (mapcar #'zhihu--org-metadata-keyword
+          zhihu--metadata-empty-id-slot-fields)
+  "允许保留空值、等待首次发布写回的 Org 关键字。")
 
-(defun zhihu--md-top-level-key-count (frontmatter key)
-  "返回 FRONTMATTER 中普通顶层 KEY 的数量。"
-  (let ((case-fold-search nil)
-        (count 0))
-    (with-temp-buffer
-      (insert frontmatter)
-      (goto-char (point-min))
-      (while (re-search-forward
-              (zhihu--md-top-level-key-regexp key) nil t)
-        (cl-incf count)))
-    count))
+(defun zhihu--org-collect-keywords (&optional names)
+  "收集当前 buffer 的 NAMES 文档级关键字。
+NAMES 缺省为本包拥有的知乎关键字。
+忽略源码块里的同名文本；重复值立即报错，只有内容 ID 槽允许为空。
+返回 (KEY . VALUE) alist。"
+  (require 'org)
+  (unless (derived-mode-p 'org-mode)
+    (delay-mode-hooks (org-mode)))
+  (mapcar
+   (lambda (entry)
+     (let ((key (car entry))
+           (values (cdr entry)))
+       (unless (= (length values) 1)
+         (error "zhihu: Org 关键字 %s 不能重复" key))
+       (let ((value (string-trim (car values))))
+         (when (and (string-empty-p value)
+                    (not (member key zhihu--org-empty-id-keyword-names)))
+           (error "zhihu: Org 关键字 %s 不能为空" key))
+         (cons key value))))
+   (org-collect-keywords (or names zhihu--org-keyword-names))))
 
-(defun zhihu--md-zhihu-region (frontmatter)
-  "返回 FRONTMATTER 中顶层 zhihu mapping 的零基 (BEG . END)。"
-  (with-temp-buffer
-    (insert frontmatter)
-    (goto-char (point-min))
-    (when (re-search-forward
-           (zhihu--md-top-level-key-regexp "zhihu") nil t)
-      (let ((beg (match-beginning 0))
-            end)
-        (goto-char beg)
-        (forward-line 1)
-        (setq end (point))
-        (while (< (point) (point-max))
-          (cond
-           ((looking-at "[ \t]*#")
-            (forward-line 1))
-           ((looking-at "[ \t]+")
-            (forward-line 1)
-            (setq end (point)))
-           ((looking-at "[ \t]*\n")
-            (forward-line 1))
-           (t
-            (goto-char (point-max)))))
-        (cons (1- beg) (1- end))))))
+(defun zhihu--org-topics (raw)
+  "把 Org 关键字里的 RAW JSON array 解析为话题名称 sequence。"
+  (let ((topics
+         (condition-case nil
+             (json-parse-string raw
+                                :array-type 'array
+                                :null-object :json-null
+                                :false-object :json-false)
+           (error nil))))
+    (unless (vectorp topics)
+      (error "zhihu: ZHIHU_TOPICS 必须是合法 JSON array"))
+    topics))
 
-(defun zhihu--md-reject-duplicate-zhihu-fields (frontmatter region)
-  "拒绝 FRONTMATTER 的 zhihu REGION 中重复的已知字段。"
-  (let ((mapping (substring frontmatter (car region) (cdr region))))
-    (dolist (field
-             (append zhihu--metadata-scalar-fields
-                     '(:topics)))
-      (let ((case-fold-search nil)
-            (count 0)
-            (regexp
-             (concat "^[ \t]+"
-                     (zhihu--md-yaml-key-regexp
-                      (zhihu--metadata-field-name field))
-                     "[ \t]*:")))
-        (with-temp-buffer
-          (insert mapping)
-          (goto-char (point-min))
-          (while (re-search-forward regexp nil t)
-            (cl-incf count)))
-        (when (> count 1)
-          (error "zhihu: Markdown zhihu 字段 %s 不能重复"
-                 (zhihu--metadata-field-name field)))))))
-
-(defun zhihu--md-parse-frontmatter-meta (fm)
-  "解析 Markdown front matter 字符串 FM 中的文档与知乎 metadata。"
-  (if (not fm)
-      (zhihu--source-meta-from-parts nil nil nil)
-    (let* ((banner-count (zhihu--md-top-level-key-count fm "banner"))
-           (toc-count (zhihu--md-top-level-key-count fm "toc"))
-           (zhihu-count (zhihu--md-top-level-key-count fm "zhihu"))
-           (_top-level-check
-            (when (> zhihu-count 1)
-              (error
-               "zhihu: Markdown front matter 的顶层 zhihu 不能重复")))
-           (_banner-check
-            (when (> banner-count 1)
-              (error
-               "zhihu: Markdown front matter 的顶层 banner 不能重复")))
-           (_toc-check
-            (when (> toc-count 1)
-              (error
-               "zhihu: Markdown front matter 的顶层 toc 不能重复")))
-           (zhihu-region
-            (and (= zhihu-count 1) (zhihu--md-zhihu-region fm)))
-           (_zhihu-shape-check
-            (when (= zhihu-count 1)
-              (unless
-                  (string-match-p
-                   (zhihu--md-top-level-key-regexp "zhihu" t) fm)
-                (error
-                 "zhihu: Markdown front matter 的顶层 zhihu 必须是独占一行的 mapping"))
-              (zhihu--md-reject-duplicate-zhihu-fields
-               fm zhihu-region)))
-           (parsed-pair
-            (condition-case err
-                (list
-                 (yaml-parse-string fm
-                                    :object-type 'plist
-                                    :sequence-type 'array)
-                 ;; yaml.el 默认会把加引号的 "123"/"true" 也转换成
-                 ;; 数字/布尔值；字符串字段和 topics 需要保真读取。
-                 (yaml-parse-string fm
-                                    :object-type 'plist
-                                    :sequence-type 'array
-                                    :string-values t))
-              (error
-               (error "zhihu: Markdown front matter 解析失败：%s"
-                      (error-message-string err)))))
-           (parsed (car parsed-pair))
-           (parsed-strings (cadr parsed-pair))
-           (banner-present-p
-            (and (listp parsed) (plist-member parsed :banner)))
-           (banner
-            (when banner-present-p
-              (or
-               (zhihu--normalize-metadata-string
-                "banner"
-                (let ((value (plist-get parsed :banner)))
-                  (if (memq value '(nil :null :json-null))
-                      value
-                    (plist-get parsed-strings :banner))))
-               (error
-                "zhihu: banner 不能为空；未设置时请删除该字段"))))
-           (toc-present-p
-            (and (listp parsed) (plist-member parsed :toc)))
-           (toc
-            (when toc-present-p
-              (let ((value (plist-get parsed :toc)))
-                (unless (memq value '(t :false :json-false))
-                  (error
-                   "zhihu: Markdown 顶层 toc 必须是 true 或 false"))
-                (eq value t))))
-           (zhihu-present-p
-            (and (listp parsed) (plist-member parsed :zhihu)))
-           (z (and zhihu-present-p (plist-get parsed :zhihu)))
-           (z-strings
-            (and (listp parsed-strings)
-                 (plist-get parsed-strings :zhihu)))
-           (title
-            (and (listp parsed-strings)
-                 (plist-get parsed-strings :title))))
-      (when (and zhihu-present-p (zerop zhihu-count))
+(defun zhihu--org-toc-enabled-p (raw)
+  "把 Org 原生 `#+TOC' 的 RAW 值规范化为是否启用文章目录。"
+  (when raw
+    (let ((case-fold-search t))
+      (unless
+          (string-match-p
+           "\\`headlines\\(?:[ \t]+[1-3]\\)?\\'"
+           raw)
         (error
-         "zhihu: Markdown front matter 的顶层 zhihu 必须使用普通 mapping key"))
-      (when (and toc-present-p (zerop toc-count))
-        (error
-         "zhihu: Markdown toc 必须使用普通的顶层 mapping key"))
-      (when zhihu-present-p
-        (unless (listp z)
-          (error "zhihu: Markdown front matter 的 zhihu 必须是 mapping"))
-        (dolist (field '(:column-id :topics))
-          (when (plist-member z field)
-            (setq z
-                  (plist-put z field
-                             (plist-get z-strings field))))))
-      (zhihu--source-meta-from-parts z title banner toc))))
+         "zhihu: Org 目录只支持 #+TOC: headlines 1..3")))
+    t))
 
-(defun zhihu--md-read-meta (file)
-  "读取 FILE 的 YAML frontmatter，并返回统一 metadata plist。"
-  (let* ((text (with-temp-buffer
-                 (insert-file-contents file)
-                 (buffer-string)))
-         (fm (car (zhihu--md-split-frontmatter text))))
-    (zhihu--md-parse-frontmatter-meta fm)))
-
-(defun zhihu--md-write-zhihu-meta (file meta)
-  "把 META 中的 zhihu 字段写入 FILE 的 YAML frontmatter。"
+(defun zhihu--org-read-meta (file)
+  "从 Org FILE 读取通用文档 metadata 与知乎 metadata。"
   (with-temp-buffer
     (insert-file-contents file)
-    (let* ((text (buffer-string))
-           (split (zhihu--md-split-frontmatter text))
-           (fm (car split))
-           (body (cdr split))
-           (new-zhihu (zhihu--format-zhihu-yaml meta))
-           (zhihu-count
-            (and fm (zhihu--md-top-level-key-count fm "zhihu")))
-           (_
-            (when (and zhihu-count (> zhihu-count 1))
-              (error
-               "zhihu: Markdown front matter 的顶层 zhihu 不能重复")))
-           (region (and fm (zhihu--md-zhihu-region fm))))
-      (cond
-       ((and (null fm) (not (string-empty-p new-zhihu)))
-        ;; 整文件没 frontmatter，整段塞顶上
-        (erase-buffer)
-        (insert "---\n" new-zhihu "---\n" body))
-       (region
-        ;; 已有 zhihu 块，替换
-        (let ((new-fm
-               (concat (substring fm 0 (car region))
-                       new-zhihu
-                       (substring fm (cdr region)))))
-          (erase-buffer)
-          (insert "---\n" new-fm "\n---\n" body)))
-       ((not (string-empty-p new-zhihu))
-        ;; frontmatter 有但没 zhihu 字段，append
-        (erase-buffer)
-        (insert "---\n" fm "\n" new-zhihu "---\n" body))))
-    (write-region (point-min) (point-max) file nil 'silent)))
+    (require 'org)
+    (delay-mode-hooks (org-mode))
+    (let* ((keywords
+            (zhihu--org-collect-keywords
+             (append
+              '("BANNER" "TOC")
+              zhihu--org-keyword-names)))
+           (title
+            (cdr
+             (assoc-string
+              "TITLE"
+              (org-collect-keywords '("TITLE") '("TITLE"))
+              t)))
+           (banner
+            (cdr (assoc-string "BANNER" keywords t)))
+           (toc
+            (zhihu--org-toc-enabled-p
+             (cdr (assoc-string "TOC" keywords t))))
+           z)
+      (dolist (field zhihu--metadata-scalar-fields)
+        (when-let*
+            ((value
+              (cdr
+               (assoc-string
+                (zhihu--org-metadata-keyword field) keywords t))))
+          (setq z (plist-put z field value))))
+      (when-let*
+          ((raw
+            (cdr
+             (assoc-string
+              (zhihu--org-metadata-keyword :topics) keywords t))))
+        (setq z (plist-put z :topics (zhihu--org-topics raw))))
+      (zhihu--source-meta-from-parts z title banner toc))))
 
-(defun zhihu--format-zhihu-yaml (meta)
-  "格式化 META 对应的 zhihu YAML 块。"
+(defun zhihu--format-org-zhihu-metadata (meta)
+  "生成 META 对应的 Org `#+ZHIHU_*' metadata 行。"
   (let* ((topics (plist-get meta :topics))
          (lines
-          (mapcar
+         (mapcar
            (pcase-lambda (`(,field . ,value))
              (if (null value)
-                 (format "  %s:" (zhihu--metadata-field-name field))
-               (format "  %s: %s"
-                       (zhihu--metadata-field-name field)
-                       (if (eq value t)
-                           "true"
-                         (json-encode-string value)))))
+                 (format "#+%s:"
+                         (zhihu--org-metadata-keyword field))
+               (format "#+%s: %s"
+                       (zhihu--org-metadata-keyword field)
+                       (if (eq value t) "true" value))))
            (zhihu--metadata-scalar-entries meta))))
     (when topics
       (setq lines
             (append
              lines
-             (list "  topics:")
-             (mapcar
-              (lambda (name)
-                (format "    - %s" (json-encode-string name)))
-              topics))))
+             (list
+              (format
+               "#+%s: %s"
+               (zhihu--org-metadata-keyword :topics)
+               (json-serialize (vconcat topics)
+                               :null-object :json-null
+                               :false-object :json-false))))))
     (if lines
-        (concat "zhihu:\n"
-                (mapconcat #'identity lines "\n")
-                "\n")
+        (concat (mapconcat #'identity lines "\n") "\n")
       "")))
 
+(defun zhihu--org-write-zhihu-meta (file meta)
+  "把 META 中的知乎渠道字段写入 Org FILE。"
+  (let ((block (zhihu--format-org-zhihu-metadata meta)))
+    (with-temp-buffer
+      (insert-file-contents file)
+      (require 'org)
+      (delay-mode-hooks (org-mode))
+      (let (regions)
+        (org-element-map (org-element-parse-buffer) 'keyword
+			 (lambda (node)
+			   (when (member (org-element-property :key node)
+					 zhihu--org-keyword-names)
+			     (let ((begin (org-element-property :begin node)))
+			       (push (cons begin
+					   (save-excursion
+					     (goto-char begin)
+					     (line-beginning-position 2)))
+				     regions)))))
+        (dolist (region (sort regions (lambda (a b) (> (car a) (car b)))))
+          (delete-region (car region) (cdr region))))
+      (goto-char (point-min))
+      (let ((case-fold-search t))
+        (while (looking-at "^#\\+[[:alnum:]_]+:.*\n")
+          (goto-char (match-end 0))))
+      (insert block)
+      (write-region (point-min) (point-max) file nil 'silent))))
 
-
-
-
-
-
+;; Metadata dispatch
 
 ;; Metadata dispatch
 
 (defun zhihu--file-format (file)
-  "返回 FILE 对应的 `typst' 或 `markdown'；其它返回 nil。"
+  "返回 FILE 对应的 `typst' 或 `org'；其它返回 nil。"
   (pcase (downcase (or (file-name-extension file) ""))
     ("typ" 'typst)
-    ((or "md" "markdown") 'markdown)
+    ("org" 'org)
     (_ nil)))
 
 (defun zhihu--read-source-meta (file)
   "从 FILE 读取通用文档 metadata 与知乎渠道 metadata。
-question-id、article-id 与 thought-id 必须且只能出现一个，分别表示回答、文章与想法。"
+question-id 与 article-id 必须且只能出现一个，分别表示回答与文章。"
   (cl-ecase (zhihu--file-format file)
     (typst
      (let ((source-meta (zhihu--typst-query-metadata file)))
@@ -2119,13 +1989,13 @@ question-id、article-id 与 thought-id 必须且只能出现一个，分别表�
         nil
         (plist-get source-meta :banner)
         (plist-get source-meta :toc))))
-    (markdown (zhihu--md-read-meta file))))
+    (org (zhihu--org-read-meta file))))
 
 (defun zhihu--write-zhihu-meta (file meta)
   "把 META 中的知乎渠道状态写回 FILE。"
   (cl-ecase (zhihu--file-format file)
     (typst (zhihu--typst-write-native-metadata file meta))
-    (markdown (zhihu--md-write-zhihu-meta file meta))))
+    (org (zhihu--org-write-zhihu-meta file meta))))
 
 ;;;; HTML conversion
 
@@ -2568,170 +2438,259 @@ CANONICAL 非 nil 时要求 TEXT 已经是规范形式。"
                           (mapcar #'rewrite (dom-children node)))))))))
             (zhihu--outer-html (rewrite dom))))))))
 
-;; Source formats
-;;
-;; Pandoc 负责 Markdown → HTML，也强制规范化 Typst HTML/MathML；
-;; Typst CLI 负责先把 Typst 源稿编译成语义 HTML。
-;; 转换都通过临时 buffer + call-process-region，避免 shell 转义。
+(defun zhihu--org-footnote-reference-data (definition)
+  "从 ox-html 脚注 DEFINITION 提取知乎引用的 (:text ... :url ...)。"
+  (let* ((children (zhihu--dom-trim-blank-children definition))
+         (number (car children))
+         (footpara (cadr children)))
+    (unless
+        (and
+         (= (length children) 2)
+         (consp number)
+         (eq (dom-tag number) 'sup)
+         (consp footpara)
+         (eq (dom-tag footpara) 'div)
+         (zhihu--node-has-class-p footpara "footpara")
+         (equal (dom-attr footpara 'role) "doc-footnote"))
+      (error "zhihu: Org 脚注定义结构不受支持"))
+    (let* ((number-link
+            (car
+             (cl-remove-if-not
+              (lambda (node)
+                (and
+                 (consp node)
+                 (eq (dom-tag node) 'a)
+                 (zhihu--node-has-class-p node "footnum")))
+              (zhihu--dom-significant-children number))))
+           (paragraphs (zhihu--dom-trim-blank-children footpara)))
+      (unless
+          (and
+           number-link
+           (= (length paragraphs) 1)
+           (consp (car paragraphs))
+           (eq (dom-tag (car paragraphs)) 'p))
+        (error "zhihu: Org 脚注必须只包含一个段落"))
+      (let ((nodes
+             (zhihu--dom-trim-blank-children (car paragraphs)))
+            (link-count 0)
+            (url ""))
+        (cl-labels
+            ((validate
+              (node)
+              (cond
+               ((stringp node) nil)
+               ((not (consp node))
+                (error "zhihu: Org 脚注包含无法识别的节点"))
+               ((eq (dom-tag node) 'a)
+                (cl-incf link-count)
+                (when (> link-count 1)
+                  (error "zhihu: 一条 Org 脚注最多只能包含一个链接"))
+                (setq url (dom-attr node 'href))
+                (mapc #'validate (dom-children node)))
+               ((memq (dom-tag node)
+                      '(em strong b i s strike del code span small sub sup mark))
+                (mapc #'validate (dom-children node)))
+               (t
+                (error "zhihu: Org 脚注不支持 %s 节点"
+                       (dom-tag node))))))
+          (mapc #'validate nodes))
+        (zhihu--reference-data
+         (mapconcat
+          (lambda (node)
+            (if (stringp node) node (dom-inner-text node)))
+          nodes "")
+         url "Org 脚注")))))
 
-(defconst zhihu--pandoc-filter
-  "local markdown_alerts = ZHIHU_MARKDOWN_ALERTS == true
+(defun zhihu--org-footnote-definition-id (definition)
+  "返回 ox-html 脚注 DEFINITION 的 fragment ID。"
+  (let* ((number (car (zhihu--dom-trim-blank-children definition)))
+         (links
+          (and
+           (consp number)
+           (cl-remove-if-not
+            (lambda (node)
+              (and
+               (consp node)
+               (eq (dom-tag node) 'a)
+               (zhihu--node-has-class-p node "footnum")))
+            (zhihu--dom-significant-children number))))
+         (id (and (= (length links) 1) (dom-attr (car links) 'id))))
+    (unless (and (stringp id) (not (string-empty-p id)))
+      (error "zhihu: Org 脚注定义缺少唯一 footnum id"))
+    id))
 
-local alert_types = {
-  note = { icon = 'ℹ', title = 'Note' },
-  tip = { icon = '💡', title = 'Tip' },
-  important = { icon = '❗', title = 'Important' },
-  warning = { icon = '⚠', title = 'Warning' },
-  caution = { icon = '⛔', title = 'Caution' },
-}
+(defun zhihu--org-footnote-reference-target (node)
+  "若 NODE 是 ox-html 脚注引用 SUP，则返回 definition fragment ID。"
+  (when (and (consp node) (eq (dom-tag node) 'sup))
+    (let ((children (zhihu--dom-significant-children node)))
+      (when
+          (and
+           (= (length children) 1)
+           (consp (car children))
+           (eq (dom-tag (car children)) 'a)
+           (zhihu--node-has-class-p (car children) "footref"))
+        (let ((href (dom-attr (car children) 'href)))
+          (unless
+              (and
+               (stringp href)
+               (string-match "\\`#\\([^#[:space:]]+\\)\\'" href))
+            (error "zhihu: Org 脚注引用缺少有效的 fragment 链接"))
+          (match-string 1 href))))))
 
-local function reference_fail(message)
-  error('zhihu-reference: ' .. message, 0)
-end
+(defun zhihu--org-rewrite-footnotes (html)
+  "把 ox-html 脚注改写为共用 HTML 层可识别的知乎引用 marker。"
+  (let* ((dom
+          (zhihu--parse-html (concat "<html><body>" html "</body></html>")))
+         (body (car (dom-by-tag dom 'body)))
+         (sentinels
+          (dom-search
+           body
+           (lambda (node)
+             (and (consp node)
+                  (assq 'data-zhihu-reference (cadr node))))))
+         (sections
+          (dom-search
+           body
+           (lambda (node)
+             (and
+              (consp node)
+              (eq (dom-tag node) 'div)
+              (equal (dom-attr node 'id) "footnotes")))))
+         (references
+          (dom-search body #'zhihu--org-footnote-reference-target)))
+    (when sentinels
+      (error "zhihu: Org HTML 不能预先包含内部引用 marker"))
+    (if (and (null sections) (null references))
+        html
+      (unless (and (= (length sections) 1) references)
+        (error "zhihu: Org 脚注引用与定义结构不完整"))
+      (let* ((section (car sections))
+             (definitions (make-hash-table :test 'equal))
+             (reference-data (make-hash-table :test 'equal))
+             (numbers (make-hash-table :test 'equal))
+             (next-number 0))
+        (dolist
+            (definition
+             (dom-search
+              section
+              (lambda (node)
+                (and
+                 (consp node)
+                 (eq (dom-tag node) 'div)
+                 (zhihu--node-has-class-p node "footdef")))))
+          (let ((id (zhihu--org-footnote-definition-id definition)))
+            (when (gethash id definitions)
+              (error "zhihu: Org 脚注定义 id 重复：%s" id))
+            (puthash id definition definitions)))
+        (cl-labels
+            ((rewrite
+              (node)
+              (cond
+               ((stringp node) node)
+               ((not (consp node)) node)
+               ((eq node section) nil)
+               ((zhihu--org-footnote-reference-target node)
+                (let* ((target (zhihu--org-footnote-reference-target node))
+                       (definition (gethash target definitions)))
+                  (unless definition
+                    (error "zhihu: Org 脚注引用缺少定义：%s" target))
+                  (let ((data
+                         (or
+                          (gethash target reference-data)
+                          (puthash
+                           target
+                           (zhihu--org-footnote-reference-data definition)
+                           reference-data)))
+                        (numero
+                         (or
+                          (gethash target numbers)
+                          (puthash target (cl-incf next-number) numbers))))
+                    (zhihu--reference-marker data numero))))
+               (t
+                (cons
+                 (dom-tag node)
+                 (cons
+                  (copy-tree (cadr node))
+                  (delq nil (mapcar #'rewrite (dom-children node)))))))))
+          (zhihu--inner-html
+           `(body nil ,@(delq nil (mapcar #'rewrite (dom-children body))))))))))
 
-local function normalize_space(value)
-  return (value
-    :gsub('%s+', ' ')
-    :gsub('^ ', '')
-    :gsub(' $', ''))
-end
+(defun zhihu--org-html-latex-fragment-filter (text _backend _info)
+  "把 ox-html 的 LaTeX fragment TEXT 包装成通用 math span。"
+  (let* ((leading
+          (and (string-match "\\`[ \t\r\n]+" text) (match-string 0 text)))
+         (trailing
+          (and (string-match "[ \t\r\n]+\\'" text) (match-string 0 text)))
+         (formula (string-trim text)))
+    (format
+     "%s<span class=\"math %s\">%s</span>%s"
+     (or leading "")
+     (if (string-prefix-p "\\[" formula) "display" "inline")
+     (org-html-encode-plain-text formula)
+     (or trailing ""))))
 
-local function web_url(value)
-  return not value:find('%c')
-    and value:lower():match('^https?://[^/%s?#]+') ~= nil
-end
+(defun zhihu--org-html-latex-environment-filter (text _backend _info)
+  "把 ox-html 的 LaTeX environment TEXT 包装成通用 display math span。"
+  (format
+   "<p><span class=\"math display\">%s</span></p>"
+   (org-html-encode-plain-text text)))
 
-local reference_numbers = {}
-local next_reference_number = 0
+(defun zhihu--org-structural-container-p (node)
+  "若 NODE 只是 ox-html 添加的结构包装，则返回非 nil。"
+  (and
+   (consp node)
+   (eq (dom-tag node) 'div)
+   (cl-some
+    (lambda (class)
+      (or
+       (equal class "org-src-container")
+       (string-prefix-p "outline-" class)
+       (string-prefix-p "outline-text-" class)))
+    (split-string (or (dom-attr node 'class) "") "[ \t\r\n]+" t))))
 
-local function make_reference(note)
-  if #note.content ~= 1
-      or (note.content[1].t ~= 'Para'
-          and note.content[1].t ~= 'Plain') then
-    reference_fail('脚注必须只包含一个段落')
-  end
+(defun zhihu--org-normalize-node (node)
+  "去掉 ox-html NODE 中的结构包装，返回零个或多个节点。"
+  (cond
+   ((stringp node) (list node))
+   ((not (consp node)) nil)
+   ((zhihu--org-structural-container-p node)
+    (cl-mapcan #'zhihu--org-normalize-node (dom-children node)))
+   (t
+    (let ((children
+           (cl-mapcan #'zhihu--org-normalize-node (dom-children node))))
+      (when (eq (dom-tag node) 'p)
+        (while
+            (and
+             (stringp (car children))
+             (string-empty-p (string-trim (car children))))
+          (setq children (cdr children)))
+        (when (stringp (car children))
+          (setcar children (string-trim-left (car children))))
+        (while
+            (and
+             children
+             (stringp (car (last children)))
+             (string-empty-p (string-trim (car (last children)))))
+          (setq children (butlast children)))
+        (when-let* ((tail (last children))
+                    (text (and (stringp (car tail)) (car tail))))
+          (setcar tail (string-trim-right text))))
+      (list
+       (cons
+        (dom-tag node)
+        (cons (copy-tree (dom-attributes node)) children)))))))
 
-  local link_count = 0
-  local url = ''
-  local text_doc = pandoc.Pandoc(note.content):walk({
-    Link = function(link)
-      link_count = link_count + 1
-      if link_count > 1 then
-        reference_fail('一条脚注最多只能包含一个链接')
-      end
+(defun zhihu--org-normalize-structure (html)
+  "从 HTML 中移除只供 ox-html 页面布局使用的包装元素。"
+  (let* ((dom
+          (zhihu--parse-html (concat "<html><body>" html "</body></html>")))
+         (body (car (dom-by-tag dom 'body))))
+    (zhihu--inner-html
+     `(body nil
+            ,@(cl-mapcan #'zhihu--org-normalize-node
+                         (dom-children body))))))
 
-      local target = link.target
-      if not web_url(target) then
-        reference_fail(
-          '脚注链接必须使用包含 host 的 http:// 或 https:// URL'
-        )
-      end
-      url = target
-      return link.content
-    end,
 
-    Image = function()
-      reference_fail('脚注不能包含图片')
-    end,
-
-    Math = function()
-      reference_fail('脚注不能包含公式')
-    end,
-
-    Note = function()
-      reference_fail('脚注不能嵌套脚注')
-    end,
-
-    RawInline = function()
-      reference_fail('脚注不能包含 raw inline')
-    end,
-
-    RawBlock = function()
-      reference_fail('脚注不能包含 raw block')
-    end,
-  })
-
-  local text = normalize_space(pandoc.utils.stringify(text_doc))
-  if text == '' then
-    reference_fail('脚注文字不能为空')
-  elseif text:find('%c') then
-    reference_fail('脚注文字不能包含控制字符')
-  end
-
-  -- Pandoc 的 Note 不保留源 label；用最终的原生引用语义识别重复引用。
-  local key =
-    tostring(#text) .. ':' .. text .. ':' .. tostring(#url) .. ':' .. url
-  local numero = reference_numbers[key]
-  if numero == nil then
-    next_reference_number = next_reference_number + 1
-    numero = next_reference_number
-    reference_numbers[key] = numero
-  end
-
-  local marker = pandoc.Span({
-    pandoc.Str('[' .. tostring(numero) .. ']'),
-  })
-  marker.attributes['data-zhihu-reference'] = 'true'
-  marker.attributes['data-text'] = text
-  marker.attributes['data-url'] = url
-  marker.attributes['data-numero'] = tostring(numero)
-  return marker
-end
-
-local function alert_title_block(alert)
-  return pandoc.Para({
-    pandoc.Strong({
-      pandoc.Str(alert.icon),
-      pandoc.Space(),
-      pandoc.Str(alert.title),
-    }),
-  })
-end
-
-local function exact_div_class(div, class)
-  return div.t == 'Div'
-    and div.identifier == ''
-    and #div.classes == 1
-    and div.classes[1] == class
-end
-
-local function make_modern_alert(div)
-  if not markdown_alerts or #div.classes ~= 1 then
-    return nil
-  end
-
-  local alert = alert_types[div.classes[1]]
-  local title = div.content[1]
-  if alert == nil
-      or not exact_div_class(div, div.classes[1])
-      or title == nil
-      or not exact_div_class(title, 'title')
-      or #title.content ~= 1
-      or title.content[1].t ~= 'Para'
-      or pandoc.utils.stringify(title) ~= alert.title then
-    return nil
-  end
-
-  local blocks = pandoc.List({alert_title_block(alert)})
-  for i = 2, #div.content do
-    blocks:insert(div.content[i])
-  end
-  return pandoc.BlockQuote(blocks)
-end
-
-function Pandoc(doc)
-  reference_numbers = {}
-  next_reference_number = 0
-  local transforms = {
-    Note = make_reference,
-  }
-  if markdown_alerts then
-    transforms.Div = make_modern_alert
-  end
-  return doc:walk(transforms)
-end
-"
-  "Pandoc 中把脚注和 Markdown Alert 转成知乎原生节点的 Lua filter。")
 
 (defun zhihu--h-cite-node-p (node)
   "NODE 是否是 Microformats2 `h-cite' 根节点。"
@@ -2867,7 +2826,10 @@ end
                  when (string-prefix-p "language-" cls)
                  return (substring cls (length "language-")))
         (cl-loop for cls in classes
-                 unless (member cls '("sourceCode" "code")) return cls)
+                 when (string-prefix-p "src-" cls)
+                 return (substring cls (length "src-")))
+        (cl-loop for cls in classes
+                 unless (member cls '("sourceCode" "code" "src")) return cls)
         "")))
 
 (defun zhihu--captioned-figure-parts (node)
@@ -3008,7 +2970,7 @@ STANDALONE-IMAGE 非 nil 表示 NODE 是独占段落或带图注的普通图片�
       (cons tag (cons attrs children))))))
 
 (defun zhihu--zhihuify-html (html)
-  "把 HTML fragment 转成知乎可接受的公式、代码、表格、图片和 mention。"
+  "把 HTML fragment 转成知乎可接受的公式、代码、表格和图片。"
   (let* ((dom (zhihu--parse-html (concat "<html><body>" html "</body></html>")))
          (body (car (dom-by-tag dom 'body)))
          (new-body `(body nil ,@(mapcar #'zhihu--zhihuify-node
@@ -3027,7 +2989,7 @@ STANDALONE-IMAGE 非 nil 表示 NODE 是独占段落或带图注的普通图片�
 
 (defun zhihu--render-mermaid-png (source)
   "用 Mermaid CLI 把 SOURCE 渲染为 PNG 字节。
-只有 Markdown 中实际出现 Mermaid code block 时才要求 PATH 中存在 `mmdc'。"
+只有源稿中实际出现 Mermaid code block 时才要求 PATH 中存在 `mmdc'。"
   (when (string-empty-p (string-trim source))
     (error "zhihu: Mermaid code block 不能为空"))
   (unless (executable-find "mmdc")
@@ -3087,40 +3049,40 @@ STANDALONE-IMAGE 非 nil 表示 NODE 是独占段落或带图注的普通图片�
                     (dom-children body)))))
     (zhihu--inner-html new-body)))
 
-(defun zhihu--pandoc-to-zhihu-html (from input shift-headings)
-  "用 Pandoc 的 FROM 格式把 INPUT 转成知乎 HTML。
-SHIFT-HEADINGS 非 nil 时把正文标题整体下移一级，为页面标题保留 h1。"
-  (let ((filter
-         (make-temp-file
-          "zhihu-pandoc-" nil ".lua"
-          (concat
-           (when (string-prefix-p "gfm" from)
-             "ZHIHU_MARKDOWN_ALERTS = true\n")
-           zhihu--pandoc-filter))))
-    (unwind-protect
-        (zhihu--zhihuify-html
-         (zhihu--shell-convert
-          "pandoc"
-          (append
-           (list "-f" from "-t" "html5"
-                 "--lua-filter" filter
-                 "--mathjax" "--wrap=none" "--no-highlight")
-           (when shift-headings
-             (list "--shift-heading-level-by=1")))
-          input))
-      (ignore-errors (delete-file filter)))))
-
 (defun zhihu--normalize-html (html)
   "用 Pandoc 规范化 Typst HTML，再转换为知乎方言 HTML。"
-  (zhihu--pandoc-to-zhihu-html
-   "html" (zhihu--typst-rewrite-footnotes html) nil))
+  (zhihu--zhihuify-html
+   (zhihu--shell-convert
+    "pandoc"
+    '("-f" "html" "-t" "html5" "--mathjax" "--wrap=none"
+      "--no-highlight")
+    (zhihu--typst-rewrite-footnotes html))))
 
-(defun zhihu--md->html (md)
-  "Markdown → 知乎方言 HTML；Pandoc 同时读取开头的 YAML frontmatter。"
-  (zhihu--render-mermaid-blocks
-   (zhihu--pandoc-to-zhihu-html
-    "gfm+alerts+yaml_metadata_block+implicit_figures+attributes" md
-    zhihu-enable-markdown-heading-level-shift)))
+
+
+(defun zhihu--org->html (org-text)
+  "ORG-TEXT → 知乎方言 HTML。"
+  (let ((org-export-use-babel nil)
+        (org-confirm-babel-evaluate t)
+        (org-export-with-section-numbers nil)
+        ;; 禁用自动目录；显式 #+TOC 仍由 ox-html 导出。
+        (org-export-with-toc nil)
+        (org-html-htmlize-output-type nil)
+        (org-html-head-include-default-style nil)
+        (org-html-head-include-scripts nil)
+        (org-export-filter-latex-fragment-functions
+         '(zhihu--org-html-latex-fragment-filter))
+        (org-export-filter-latex-environment-functions
+         '(zhihu--org-html-latex-environment-filter)))
+    (with-temp-buffer
+      (insert org-text)
+      (delay-mode-hooks (org-mode))
+      (zhihu--render-mermaid-blocks
+       (zhihu--zhihuify-html
+        (zhihu--org-normalize-structure
+         (zhihu--org-rewrite-footnotes
+          (org-export-as
+           'html nil nil t '(:section-numbers nil :with-toc nil)))))))))
 
 
 ;; Source conversion entry points
@@ -3162,13 +3124,13 @@ SHIFT-HEADINGS 非 nil 时把正文标题整体下移一级，为页面标题保
     (unless (string-empty-p title) title)))
 
 (defun zhihu--source-to-html (file)
-  "把 Typst 或 Markdown FILE 转为知乎 HTML。"
+  "把 Typst 或 Org FILE 转为知乎 HTML。"
   (pcase (zhihu--file-format file)
     ('typst
      (let ((full (zhihu--typst-compile-html file)))
        (zhihu--normalize-html full)))
-    ('markdown
-     (zhihu--md->html
+    ('org
+     (zhihu--org->html
       (with-temp-buffer
         (insert-file-contents file)
         (buffer-string))))
@@ -3177,8 +3139,8 @@ SHIFT-HEADINGS 非 nil 时把正文标题整体下移一级，为页面标题保
 (defun zhihu--compile-source-document
     (file metadata-title &optional title-function)
   "把 FILE 编译成统一的知乎 HTML 文档表示。
-返回 `(:format FORMAT :title TITLE :html HTML)'。Markdown 的标题来自已经
-解析的 METADATA-TITLE；Typst 的标题和正文来自同一次 HTML 编译。
+返回 `(:format FORMAT :title TITLE :html HTML)'。Org 标题来自已经解析的
+METADATA-TITLE；Typst 的标题和正文来自同一次 HTML 编译。
 非 nil 的 TITLE-FUNCTION 会在正文转换前接收标题，其返回值成为 TITLE。"
   (let ((format
          (or (zhihu--file-format file)
@@ -3213,8 +3175,7 @@ SHIFT-HEADINGS 非 nil 时把正文标题整体下移一级，为页面标题保
   "知乎网页编辑器使用的公开用户补全端点。")
 
 (defun zhihu--user-record (entry)
-  "把用户补全响应中的 ENTRY 归一化为用户 plist。
-无法安全写入 mention 的畸形条目返回 nil。"
+  "把用户补全响应中的 ENTRY 归一化为可写入 mention 的用户 plist。"
   (when (and (vectorp entry)
              (>= (length entry) 6)
              (equal (aref entry 0) "people"))
@@ -3248,7 +3209,6 @@ SHIFT-HEADINGS 非 nil 时把正文标题整体下移一级，为页面标题保
            zhihu--user-search-endpoint
            "?token=" (url-hexify-string query)
            "&max_matches=10&use_similar=0"))
-         ;; 此搜索端点不需要登录 Cookie。
          (resp (zhihu--http "GET" url))
          (status (plist-get resp :status))
          (body (plist-get resp :body)))
@@ -3279,8 +3239,7 @@ SHIFT-HEADINGS 非 nil 时把正文标题整体下移一级，为页面标题保
         (nreverse users)))))
 
 (defun zhihu--user-completion-candidates (users)
-  "把 USERS 转为补全使用的唯一 `(LABEL . USER)' 列表。
-候选以姓名开头，并用简介和用户 slug 帮助区分同名用户。"
+  "把 USERS 转为补全使用的唯一 `(LABEL . USER)' 列表。"
   (let ((used (make-hash-table :test 'equal)))
     (mapcar
      (lambda (user)
@@ -3311,11 +3270,11 @@ SHIFT-HEADINGS 非 nil 时把正文标题整体下移一级，为页面标题保
          (marker (concat "member_mention_" hash))
          (text (concat "@" name)))
     (cl-ecase format
-      (markdown
-       (setq text (string-replace "\\" "\\\\" text)
-             text (string-replace "[" "\\[" text)
-             text (string-replace "]" "\\]" text))
-       (format "[%s](%s %S)" text profile-url marker))
+      (org
+       (format "@@html:<a href=\"%s\" title=\"%s\">%s</a>@@"
+               profile-url marker
+               (string-replace
+                "@" "&#64;" (xml-escape-string text))))
       (typst
        (format
         "#html.elem(\"a\", attrs: (href: %S, title: %S), text(%S))"
@@ -3323,7 +3282,7 @@ SHIFT-HEADINGS 非 nil 时把正文标题整体下移一级，为页面标题保
 
 ;;;###autoload
 (defun zhihu-insert-user-mention (query)
-  "搜索 QUERY 对应的知乎用户，并在光标处插入 mention。"
+  "搜索 QUERY 对应的知乎用户，并在光标处插入原生 mention。"
   (interactive (list (read-string "搜索知乎用户: ")))
   (let ((source-format
          (and buffer-file-name
@@ -3353,9 +3312,6 @@ SHIFT-HEADINGS 非 nil 时把正文标题整体下移一级，为页面标题保
   zhihu--column-completion-cache-unloaded
   "当前 buffer 缓存的可投稿专栏列表。")
 
-(defvar-local zhihu--user-mention-completion-cache nil
-  "当前 buffer 中按查询词缓存的知乎用户补全结果。")
-
 (defvar-local zhihu--topic-completion-cache nil
   "当前 buffer 中按查询词缓存的知乎话题补全结果。")
 
@@ -3364,7 +3320,6 @@ SHIFT-HEADINGS 非 nil 时把正文标题整体下移一级，为页面标题保
   (setq
    zhihu--column-completion-cache
    zhihu--column-completion-cache-unloaded
-   zhihu--user-mention-completion-cache nil
    zhihu--topic-completion-cache nil))
 
 (defun zhihu--invalidate-column-completion-caches ()
@@ -3411,81 +3366,13 @@ SHIFT-HEADINGS 非 nil 时把正文标题整体下移一级，为页面标题保
          (cons label column)))
      columns)))
 
-(defun zhihu--markdown-frontmatter-bounds ()
-  "返回当前 buffer 的 Markdown front matter 内容边界。"
-  (save-excursion
-    (goto-char (point-min))
-    (when (looking-at "---[ \t]*\r?$")
-      (forward-line 1)
-      (let ((start (point)))
-        (when (re-search-forward "^---[ \t]*\r?$" nil t)
-          (cons start (line-beginning-position)))))))
 
-(defun zhihu--markdown-zhihu-buffer-region ()
-  "返回当前 Markdown buffer 顶层 `zhihu' mapping 的绝对区域。"
-  (when-let* ((frontmatter (zhihu--markdown-frontmatter-bounds))
-              (text
-               (buffer-substring-no-properties
-                (car frontmatter) (cdr frontmatter)))
-              (relative
-               (condition-case nil
-                   (zhihu--md-zhihu-region text)
-                 (error nil))))
-    (let ((beg (+ (car frontmatter) (car relative)))
-          (end (+ (car frontmatter) (cdr relative))))
-      (save-excursion
-        (goto-char beg)
-        (when (re-search-forward
-               (zhihu--md-top-level-key-regexp "zhihu")
-               (min end (line-beginning-position 3)) t)
-          (cons (match-beginning 0) end))))))
 
-(defun zhihu--markdown-zhihu-child-indentation
-    (region &optional ignored-line-start)
-  "返回 Markdown `zhihu' REGION 中直接子字段的缩进。
-IGNORED-LINE-START 非 nil 时忽略该行；字段名补全据此避免把当前未完成行
-误当作已经建立的直接子字段缩进。"
-  (save-excursion
-    (goto-char (car region))
-    (let ((root (current-indentation))
-          indentation)
-      (forward-line 1)
-      (while (< (point) (cdr region))
-        (unless (or (and ignored-line-start
-                         (= (line-beginning-position)
-                            ignored-line-start))
-                    (looking-at "[ \t]*\\(?:#\\|\r?$\\)"))
-          (let ((current (current-indentation)))
-            (when (and (> current root)
-                       (or (null indentation)
-                           (< current indentation)))
-              (setq indentation current))))
-        (forward-line 1))
-      indentation)))
 
-(defun zhihu--markdown-comment-start (start end)
-  "返回 START 与 END 间 YAML 行尾注释的起点。"
-  (let ((position start)
-        quote
-        escaped
-        found)
-    (while (and (< position end) (not found))
-      (let ((character (char-after position)))
-        (cond
-         (escaped (setq escaped nil))
-         ((and (eq quote ?\") (eq character ?\\))
-          (setq escaped t))
-         (quote
-          (when (eq character quote)
-            (setq quote nil)))
-         ((memq character '(?\" ?\'))
-          (setq quote character))
-         ((and (eq character ?#)
-               (or (= position start)
-                   (memq (char-before position) '(?\s ?\t))))
-          (setq found position))))
-      (cl-incf position))
-    found))
+
+
+
+
 
 (defun zhihu--scalar-completion-context
     (replace-start value-limit origin &optional comment-p)
@@ -3538,45 +3425,50 @@ COMMENT-P 表示 VALUE-LIMIT 后紧跟注释。"
                    " "
                  spacing)))))))))
 
-(defun zhihu--markdown-column-id-context ()
-  "返回光标所在 Markdown `column-id' 值槽的补全上下文。"
+
+
+
+
+
+(defconst zhihu--org-editing-block-types
+  '(center-block comment-block drawer dynamic-block example-block
+                 export-block property-drawer quote-block special-block
+                 src-block verse-block)
+  "不能包含文档级知乎编辑 metadata 的 Org 元素类型。")
+
+(defun zhihu--org-editing-blocked-node-p (node)
+  "NODE 位于非文档级 Org 容器中时返回非 nil。"
+  (let (blocked)
+    (while node
+      (when (memq (org-element-type node)
+                  zhihu--org-editing-block-types)
+        (setq blocked t))
+      (setq node (org-element-property :parent node)))
+    blocked))
+
+(defun zhihu--org-column-id-context ()
+  "返回光标所在 Org `ZHIHU_COLUMN_ID' 值槽的补全上下文。"
   (when (and buffer-file-name
-             (eq (zhihu--file-format buffer-file-name)
-                 'markdown))
-    (let ((origin (point))
-          (line-start (line-beginning-position))
-          (line-end (line-end-position)))
-      (when-let* ((region (zhihu--markdown-zhihu-buffer-region))
-                  (indentation
-                   (zhihu--markdown-zhihu-child-indentation
-                    region)))
-        (when (and (<= (car region) line-start)
-                   (< line-start (cdr region)))
-          (save-excursion
-            (goto-char line-start)
-            (when (and
-                   (= (current-indentation) indentation)
-                   (looking-at
-                    (concat
-                     "^[ \t]+"
-                     (zhihu--md-yaml-key-regexp "column-id")
-                     "[ \t]*:")))
-              (let* ((replace-start (match-end 0))
-                     (comment-start
-                      (zhihu--markdown-comment-start
-                       replace-start line-end))
-                     (bounds
-                      (zhihu--scalar-completion-context
-                       replace-start
-                       (or comment-start line-end)
-                       origin
-                       (and comment-start t))))
-                (and bounds
-                     (append
-                      (list :format 'markdown)
-                      bounds))))))))))
-
-
+             (eq (zhihu--file-format buffer-file-name) 'org)
+             (derived-mode-p 'org-mode))
+    (require 'org-element)
+    (let* ((origin (point))
+           (line-start (line-beginning-position))
+           (line-end (line-end-position))
+           (node (org-element-context)))
+      (when (and (eq (org-element-type node) 'keyword)
+                 (equal (org-element-property :key node)
+                        "ZHIHU_COLUMN_ID")
+                 (not (zhihu--org-editing-blocked-node-p node)))
+        (save-excursion
+          (goto-char line-start)
+          (let ((case-fold-search t))
+            (when (looking-at
+                   "^#\\+ZHIHU_COLUMN_ID[ \t]*:")
+              (when-let* ((bounds
+                          (zhihu--scalar-completion-context
+                           (match-end 0) line-end origin)))
+                (append (list :format 'org) bounds)))))))))
 
 
 (defun zhihu--typst-metadata-dictionary-info (region)
@@ -3686,15 +3578,14 @@ COMMENT-P 表示 VALUE-LIMIT 后紧跟注释。"
   "返回当前源稿光标所在 `column-id' 值槽的上下文。"
   (pcase (and buffer-file-name
               (zhihu--file-format buffer-file-name))
-    ('markdown (zhihu--markdown-column-id-context))
+    ('org (zhihu--org-column-id-context))
     ('typst (zhihu--typst-column-id-context))))
 
 (defun zhihu--topic-kind-and-limit (identities)
   "按 IDENTITIES 中唯一的内容 ID 字段返回类型和话题上限。"
   (when (= (length identities) 1)
     (pcase (car identities)
-      (:article-id (cons 'article zhihu--article-topic-limit))
-      (:thought-id (cons 'pin zhihu--pin-topic-limit)))))
+      (:article-id (cons 'article zhihu--article-topic-limit)))))
 
 (defun zhihu--double-quoted-string-info (start limit)
   "解析 START 处、不超过 LIMIT 的双引号字符串。
@@ -3796,103 +3687,48 @@ COMMENT-P 表示 VALUE-LIMIT 后紧跟注释。"
            :replace-end (plist-get item :completion-end)
            :other-topics (nreverse others)))))))
 
-(defun zhihu--markdown-direct-zhihu-fields (region indentation)
-  "返回 Markdown `zhihu' REGION 中 INDENTATION 层的已知字段。
-每项为 `(FIELD START END)'，START/END 是字段所在行的边界。"
-  (let ((case-fold-search nil)
-        found)
-    (save-excursion
-      (goto-char (car region))
-      (forward-line 1)
-      (while (< (point) (cdr region))
-        (when (= (current-indentation) indentation)
-          (let ((line-start (line-beginning-position))
-                (line-end (line-end-position)))
-            (dolist (field zhihu--metadata-fields)
-              (when (looking-at
-                     (concat
-                      "^[ \t]+"
-                      (zhihu--md-yaml-key-regexp
-                       (zhihu--metadata-field-name field))
-                      "[ \t]*:"))
-                (push (list field line-start line-end) found)))))
-        (forward-line 1)))
-    (nreverse found)))
 
-(defun zhihu--markdown-topic-items (start end indentation)
-  "返回 Markdown topics 块 START/END 中的 canonical items。"
-  (let (item-indentation items)
-    (save-excursion
-      (goto-char start)
-      (while (< (point) end)
-        (when (and (> (current-indentation) indentation)
-                   (looking-at "^[ \t]+-[ \t]*\""))
-          (let ((current (current-indentation)))
-            (when (or (null item-indentation)
-                      (< current item-indentation))
-              (setq item-indentation current
-                    items nil))
-            (when (= current item-indentation)
-              (let* ((quote-start (1- (match-end 0)))
-                     (line-end (line-end-position))
-                     (comment-start
-                      (zhihu--markdown-comment-start quote-start line-end))
-                     (limit (or comment-start line-end))
-                     (info
-                      (zhihu--double-quoted-string-info quote-start limit)))
-                (when info
-                  (save-excursion
-                    (goto-char (plist-get info :after))
-                    (skip-chars-forward " \t" limit)
-                    (when (= (point) limit)
-                      (push info items))))))))
-        (forward-line 1)))
-    (nreverse items)))
 
-(defun zhihu--markdown-topic-context ()
-  "返回当前 Markdown `zhihu.topics' item 的补全上下文。"
+
+
+
+
+
+
+(defun zhihu--org-topic-kind-and-limit ()
+  "按当前 Org buffer 的文档级 identity 返回话题类型和上限。"
+  (require 'org-element)
+  (let (identities)
+    (org-element-map
+     (org-element-parse-buffer) 'keyword
+     (lambda (node)
+       (unless (zhihu--org-editing-blocked-node-p node)
+         (pcase (org-element-property :key node)
+           ("ZHIHU_QUESTION_ID" (push :question-id identities))
+           ("ZHIHU_ARTICLE_ID" (push :article-id identities))))))
+    (zhihu--topic-kind-and-limit (nreverse identities))))
+
+(defun zhihu--org-topic-context ()
+  "返回当前 Org `ZHIHU_TOPICS' JSON item 的补全上下文。"
   (when (and buffer-file-name
-             (eq (zhihu--file-format buffer-file-name) 'markdown))
-    (let ((origin (point)))
-      (when-let* ((region (zhihu--markdown-zhihu-buffer-region))
-                  (indentation
-                   (zhihu--markdown-zhihu-child-indentation region)))
-        (let* ((fields
-                (zhihu--markdown-direct-zhihu-fields region indentation))
-               (identities
-                (mapcar
-                 #'car
-                 (cl-remove-if-not
-                  (lambda (entry)
-                    (memq (car entry)
-                          '(:question-id :article-id :thought-id)))
-                  fields)))
-               (kind-limit (zhihu--topic-kind-and-limit identities))
-               (topic-fields
-                (cl-remove-if-not
-                 (lambda (entry) (eq (car entry) :topics)) fields)))
-          (when (and kind-limit (= (length topic-fields) 1))
-            (let* ((topic-line (cadr (car topic-fields)))
-                   (block-start
-                    (save-excursion
-                      (goto-char topic-line)
-                      (line-beginning-position 2)))
-                   (block-end (cdr region)))
-              (save-excursion
-                (goto-char block-start)
-                (while (< (point) (cdr region))
-                  (unless (looking-at "[ \t]*\\(?:#.*\\)?$")
-                    (when (<= (current-indentation) indentation)
-                      (setq block-end (point))
-                      (goto-char (cdr region))))
-                  (forward-line 1)))
-              (when (and (<= block-start origin) (<= origin block-end))
+             (eq (zhihu--file-format buffer-file-name) 'org)
+             (derived-mode-p 'org-mode))
+    (require 'org-element)
+    (let* ((origin (point))
+           (node (org-element-context)))
+      (when (and (eq (org-element-type node) 'keyword)
+                 (equal (org-element-property :key node) "ZHIHU_TOPICS")
+                 (not (zhihu--org-editing-blocked-node-p node)))
+        (save-excursion
+          (goto-char (line-beginning-position))
+          (let ((case-fold-search t))
+            (when (looking-at "^#\\+ZHIHU_TOPICS[ \t]*:")
+              (let ((items
+                     (zhihu--quoted-sequence-items
+                      (match-end 0) (line-end-position) ?\[ ?\])))
                 (zhihu--topic-context-from-items
-                 'markdown
-                 (zhihu--markdown-topic-items
-                  block-start block-end indentation)
-                 origin kind-limit)))))))))
-
+                 'org items origin
+                 (zhihu--org-topic-kind-and-limit))))))))))
 
 
 (defun zhihu--typst-direct-metadata-fields (dictionary)
@@ -3940,16 +3776,13 @@ COMMENT-P 表示 VALUE-LIMIT 后紧跟注释。"
      (append
       (cdr (assq 'article zhihu--metadata-kind-scalar-fields))
       zhihu--metadata-common-scalar-fields
-      '(:topics)))
-    ('pin
-     '(:thought-id :comment-permission :topics))))
+      '(:topics)))))
 
 (defun zhihu--metadata-kind-for-identity (field)
   "返回 identity metadata FIELD 对应的稿件类型。"
   (pcase field
     (:question-id 'answer)
-    (:article-id 'article)
-    (:thought-id 'pin)))
+    (:article-id 'article)))
 
 (defun zhihu--metadata-key-candidate-fields (present-fields)
   "按 PRESENT-FIELDS 返回当前可新增的 metadata 字段。
@@ -3961,12 +3794,12 @@ PRESENT-FIELDS 必须是 dictionary 中已识别出的直接字段。若字段�
     (let ((identities
            (cl-remove-if-not
             (lambda (field)
-              (memq field '(:question-id :article-id :thought-id)))
+              (memq field '(:question-id :article-id)))
             present-fields)))
       (pcase (length identities)
         (0
          (cl-loop
-          for identity in '(:question-id :article-id :thought-id)
+          for identity in '(:question-id :article-id)
           for kind = (zhihu--metadata-kind-for-identity identity)
           for allowed = (zhihu--metadata-fields-for-kind kind)
           when (cl-every
@@ -3984,77 +3817,7 @@ PRESENT-FIELDS 必须是 dictionary 中已识别出的直接字段。若字段�
               (lambda (field) (memq field present-fields))
               allowed))))))))
 
-(defun zhihu--markdown-metadata-key-context ()
-  "返回光标所在 Markdown `zhihu' 直接字段名槽的上下文。
-只接受尚未写入冒号的普通 key。值槽、嵌套 mapping、sequence、注释、
-inline mapping，以及缩进层级不一致的位置均不触发字段名补全。"
-  (when (and buffer-file-name
-             (eq (zhihu--file-format buffer-file-name) 'markdown))
-    (let* ((origin (point))
-           (line-start (line-beginning-position))
-           (line-end (line-end-position))
-           (frontmatter (zhihu--markdown-frontmatter-bounds)))
-      (when (and frontmatter
-                 (<= (car frontmatter) line-start)
-                 (< line-start (cdr frontmatter)))
-        (let* ((frontmatter-text
-                (buffer-substring-no-properties
-                 (car frontmatter) (cdr frontmatter)))
-               (case-fold-search nil))
-          (when (= (zhihu--md-top-level-key-count
-                    frontmatter-text "zhihu")
-                   1)
-            (when-let* ((region (zhihu--markdown-zhihu-buffer-region)))
-              (when (and (< (car region) line-start)
-                         (< line-start (cdr region)))
-                (save-excursion
-                  (goto-char (car region))
-                  (when (looking-at
-                         (zhihu--md-top-level-key-regexp
-                          "zhihu" t))
-                    (let* ((root-indentation (current-indentation))
-                           (current-indentation
-                            (save-excursion
-                              (goto-char line-start)
-                              (current-indentation)))
-                           (sibling-indentation
-                            (zhihu--markdown-zhihu-child-indentation
-                             region line-start)))
-                      (when (and (> current-indentation
-                                    root-indentation)
-                                 (or (null sibling-indentation)
-                                     (= current-indentation
-                                        sibling-indentation)))
-                        (goto-char line-start)
-                        (back-to-indentation)
-                        (let ((completion-start (point))
-                              completion-end)
-                          (cond
-                           ((= (point) line-end)
-                            (setq completion-end (point)))
-                           ((looking-at
-                             "[A-Za-z0-9][A-Za-z0-9-]*")
-                            (setq completion-end (match-end 0))))
-                          (when (and completion-end
-                                     (<= completion-start origin)
-                                     (<= origin completion-end)
-                                     (save-excursion
-                                       (goto-char completion-end)
-                                       (looking-at
-                                        "[ \t]*\\(?:#.*\\)?\r?$")))
-                            (let* ((fields
-                                    (mapcar
-                                     #'car
-                                     (zhihu--markdown-direct-zhihu-fields
-                                      region current-indentation)))
-                                   (candidates
-                                    (zhihu--metadata-key-candidate-fields
-                                     fields)))
-                              (when candidates
-                                (list
-                                 :completion-start completion-start
-                                 :completion-end completion-end
-                                 :candidates candidates)))))))))))))))))
+
 
 (defun zhihu--metadata-key-capf (info)
   "根据字段名上下文 INFO 返回知乎 metadata key 的 CAPF。"
@@ -4068,10 +3831,7 @@ inline mapping，以及缩进层级不一致的位置均不触发字段名补全
       (plist-get info :candidates))
      :exclusive t)))
 
-(defun zhihu--markdown-metadata-key-capf ()
-  "返回 Markdown `zhihu' 直接字段名槽的 CAPF。"
-  (zhihu--metadata-key-capf
-   (zhihu--markdown-metadata-key-context)))
+
 
 (defun zhihu--typst-trivia-only-p (start end)
   "START 到 END 仅包含 Typst 空白或注释时返回非 nil。"
@@ -4209,7 +3969,7 @@ inline mapping，以及缩进层级不一致的位置均不触发字段名补全
                  (cl-remove-if-not
                   (lambda (entry)
                     (memq (car entry)
-                          '(:question-id :article-id :thought-id)))
+                          '(:question-id :article-id)))
                   fields)))
                (kind-limit (zhihu--topic-kind-and-limit identities))
                (topic-fields
@@ -4239,7 +3999,7 @@ inline mapping，以及缩进层级不一致的位置均不触发字段名补全
   "返回当前源稿 `topics' item 的补全上下文。"
   (pcase (and buffer-file-name
               (zhihu--file-format buffer-file-name))
-    ('markdown (zhihu--markdown-topic-context))
+    ('org (zhihu--org-topic-context))
     ('typst (zhihu--typst-topic-context))))
 
 (defun zhihu--completion-session-remember (session entries)
@@ -4312,8 +4072,7 @@ inline mapping，以及缩进层级不一致的位置均不触发字段名补全
   (let ((id (plist-get column :id)))
     (concat
      (pcase format
-       ('markdown
-        (concat " " (json-encode-string id)))
+       ('org (concat " " id))
        ('typst (concat " " (format "%S" id)))
        (_ (error "zhihu: 不支持的补全源稿格式 %S"
                  format)))
@@ -4367,306 +4126,27 @@ inline mapping，以及缩进层级不一致的位置均不触发字段名补全
        (zhihu--completion-session-finish
         session candidate status)))))
 
-(defun zhihu--markdown-body-start ()
-  "返回 Markdown 正文起点；未闭合 front matter 返回 buffer 末尾。"
-  (save-excursion
-    (goto-char (point-min))
-    (if (not (looking-at "---[ \t]*\r?$"))
-        (point-min)
-      (forward-line 1)
-      (if (re-search-forward "^---[ \t]*\r?$" nil t)
-          (progn (forward-line 1) (point))
-        (point-max)))))
 
-(defun zhihu--markdown-mention-boundary-p (position)
-  "POSITION 处的 `@' 可以开始正文 mention 时返回非 nil。"
-  (or (= position (line-beginning-position))
-      (let ((previous (char-before position)))
-        (or (memq previous
-                  '(?\s ?\t ?\r ?\n ?\( ?\[ ?\{ ?\" ?\'))
-            (and previous
-                 (> previous 127)
-                 (eq (char-syntax previous) ?.))))))
 
-(defun zhihu--markdown-fence-spec-at-line ()
-  "返回当前行 Markdown fence 的 `(CHARACTER LENGTH TAIL)'。"
-  (when (looking-at
-         (concat
-          "^[ \t]*\\(?:>[ \t]*\\)*"
-          "\\(?:\\(?:[-+*]\\|[0-9]+[.)]\\)[ \t]+\\)?"
-          "[ \t]*\\(`\\{3,\\}\\|~\\{3,\\}\\)\\(.*\\)$"))
-    (let ((marker (match-string-no-properties 1)))
-      (list (aref marker 0)
-            (length marker)
-            (match-string-no-properties 2)))))
 
-(defun zhihu--markdown-backtick-run-escaped-p (position)
-  "POSITION 处的反引号 run 被奇数个反斜杠转义时返回非 nil。"
-  (save-excursion
-    (goto-char position)
-    (let ((slashes 0))
-      (while (and (> (point) (point-min))
-                  (eq (char-before) ?\\))
-        (cl-incf slashes)
-        (backward-char))
-      (= (% slashes 2) 1))))
 
-(defun zhihu--markdown-fenced-code-ranges (body-start)
-  "返回 BODY-START 后全部 Markdown fenced code 区间。"
-  (save-excursion
-    (goto-char body-start)
-    (let (fence-character
-          fence-length
-          fence-start
-          ranges)
-      (while (< (point) (point-max))
-        (when-let* ((spec
-                    (zhihu--markdown-fence-spec-at-line)))
-          (let ((character (nth 0 spec))
-                (length (nth 1 spec))
-                (tail (nth 2 spec)))
-            (cond
-             ((null fence-character)
-              (setq fence-character character
-                    fence-length length
-                    fence-start
-                    (line-beginning-position)))
-             ((and
-               (= character fence-character)
-               (>= length fence-length)
-               (string-match-p "\\`[ \t]*\\'" tail))
-              (push
-               (cons
-                fence-start
-                (line-beginning-position 2))
-               ranges)
-              (setq fence-character nil
-                    fence-length nil
-                    fence-start nil)))))
-        (forward-line 1))
-      (when fence-start
-        (push (cons fence-start (point-max))
-              ranges))
-      (nreverse ranges))))
 
-(defun zhihu--markdown-position-in-code-ranges-p
-    (position ranges)
-  "POSITION 位于排序后的任一 code RANGES 中时返回非 nil。"
-  (cl-some
-   (lambda (range)
-     (and (<= (car range) position)
-          (< position (cdr range))))
-   ranges))
 
-(defun zhihu--markdown-inline-code-ranges
-    (body-start fenced-ranges)
-  "返回 BODY-START 后、FENCED-RANGES 外的 backtick code spans。"
-  (save-excursion
-    (goto-char body-start)
-    (let (ranges)
-      (while (re-search-forward "`+" nil t)
-        (let ((open-start (match-beginning 0))
-              (open-end (match-end 0))
-              (length (- (match-end 0)
-                         (match-beginning 0))))
-          (unless
-              (or
-               (zhihu--markdown-backtick-run-escaped-p
-                open-start)
-               (zhihu--markdown-position-in-code-ranges-p
-                open-start fenced-ranges))
-            (let (close-start close-end)
-              (save-excursion
-                (goto-char open-end)
-                (while
-                    (and
-                     (not close-start)
-                     (re-search-forward "`+" nil t))
-                  (when
-                      (and
-                       (= (- (match-end 0)
-                             (match-beginning 0))
-                          length)
-                       (not
-                        (zhihu--markdown-backtick-run-escaped-p
-                         (match-beginning 0)))
-                       (not
-                        (zhihu--markdown-position-in-code-ranges-p
-                         (match-beginning 0)
-                         fenced-ranges)))
-                    (setq close-start (match-beginning 0)
-                          close-end (match-end 0)))))
-              (when close-start
-                (push (cons open-start close-end)
-                      ranges)
-                (goto-char close-end))))))
-      (nreverse ranges))))
 
-(defun zhihu--markdown-code-ranges (body-start)
-  "一次收集 BODY-START 后全部 fenced 与 inline code 区间。"
-  (let* ((fenced
-          (zhihu--markdown-fenced-code-ranges
-           body-start))
-         (ranges
-          (sort
-           (append
-            fenced
-            (zhihu--markdown-inline-code-ranges
-             body-start fenced))
-           (lambda (left right)
-             (< (car left) (car right)))))
-         merged)
-    (dolist (range ranges)
-      (if (and merged
-               (<= (car range) (cdar merged)))
-          (setcdr
-           (car merged)
-           (max (cdr range) (cdar merged)))
-        (push (cons (car range) (cdr range))
-              merged)))
-    (nreverse merged)))
 
-(defun zhihu--markdown-link-context-p (position)
-  "POSITION 位于已有 Markdown 链接或图片中时返回非 nil。"
-  (or
-   (and (fboundp 'markdown-inside-link-p)
-        (save-excursion
-          (goto-char position)
-          (markdown-inside-link-p)))
-   (save-excursion
-     (let ((line-start
-            (progn
-              (goto-char position)
-              (line-beginning-position)))
-           (line-end (line-end-position))
-           found)
-       (goto-char line-start)
-       (while
-           (and
-            (not found)
-            (re-search-forward
-             "!?\\[[^]\n]*\\]\\(?:([^)\n]*)\\|\\[[^]\n]*\\]\\)"
-             line-end t))
-         (when (and (<= (match-beginning 0) position)
-                    (< position (match-end 0)))
-           (setq found t)))
-       found))))
 
-(defun zhihu--markdown-html-context-p
-    (position body-start code-ranges)
-  "POSITION 位于 BODY-START 后的 raw HTML 上下文时返回非 nil。
-fenced/inline code 中的标签与注释标记不参与 HTML 状态。
-CODE-RANGES 是预先收集并排序的代码区间。"
-  (save-excursion
-    (let ((case-fold-search t)
-          (void-tags
-           '(area base br col embed hr img input link meta param
-                  source track wbr))
-          (depth 0)
-          in-comment
-          range-tail)
-      (setq range-tail code-ranges)
-      (goto-char body-start)
-      (while
-          (re-search-forward
-           (concat
-            "\\(<!--\\)\\|\\(-->\\)\\|"
-            "<\\(/?\\)\\([[:alpha:]][[:alnum:]-]*\\)"
-            "\\(?:[ \t\r\n][^>]*\\)?>")
-           position t)
-        (let* ((token-start (match-beginning 0))
-               (_
-                (while
-                    (and range-tail
-                         (<= (cdar range-tail)
-                             token-start))
-                  (setq range-tail
-                        (cdr range-tail))))
-               (code-p
-                (and
-                 range-tail
-                 (<= (caar range-tail)
-                     token-start)
-                 (< token-start
-                    (cdar range-tail)))))
-          (cond
-           ((match-beginning 1)
-            (unless (or in-comment code-p)
-              (setq in-comment t)))
-           ((match-beginning 2)
-            (when (and in-comment
-                       (not code-p))
-              (setq in-comment nil)))
-           ((or in-comment code-p))
-           (t
-            (let ((closing
-                   (not
-                    (string-empty-p
-                     (or (match-string 3) ""))))
-                  (tag
-                   (intern
-                    (downcase (match-string 4))))
-                  (self-closing
-                   (string-match-p
-                    "/[ \t\r\n]*>\\'"
-                    (match-string 0))))
-              (unless
-                  (or self-closing
-                      (memq tag void-tags))
-                (setq depth
-                      (if closing
-                          (max 0 (1- depth))
-                        (1+ depth)))))))))
-      (let ((prefix
-             (buffer-substring-no-properties
-              body-start position)))
-        (or
-         in-comment
-         (> depth 0)
-         (when-let* ((relative
-                     (string-match "<[^>]*\\'" prefix)))
-           (let ((tag-start (+ body-start relative)))
-             (not
-              (zhihu--markdown-position-in-code-ranges-p
-               tag-start code-ranges)))))))))
 
-(defun zhihu--markdown-user-mention-bounds ()
-  "返回光标前 Markdown `@QUERY' 的边界，包含 `@'。"
-  (when (and buffer-file-name
-             (eq (zhihu--file-format buffer-file-name)
-                 'markdown))
-    (let ((end (point)))
-      (save-excursion
-        (skip-chars-backward "^@ \t\r\n")
-        (when (and (< (point) end)
-                   (eq (char-before) ?@))
-          (let* ((start (1- (point)))
-                 (body-start (zhihu--markdown-body-start))
-                 (code-ranges
-                  (zhihu--markdown-code-ranges body-start)))
-            (when (and
-                   (>= start body-start)
-                   (zhihu--markdown-mention-boundary-p start)
-                   (not
-                    (zhihu--markdown-position-in-code-ranges-p
-                     start code-ranges))
-                   (not
-                    (zhihu--markdown-link-context-p start))
-                   (not
-                    (zhihu--markdown-html-context-p
-                     start body-start code-ranges)))
-              (cons start end))))))))
 
-(defun zhihu--cached-user-completions (query)
-  "返回 QUERY 的用户补全结果，并在当前 buffer 中缓存。"
-  (if-let* ((entry
-            (assoc-string
-             query zhihu--user-mention-completion-cache)))
-      (cdr entry)
-    (let ((users (zhihu--search-users query)))
-      (push (cons query users)
-            zhihu--user-mention-completion-cache)
-      users)))
+
+
+
+
+
+
+
+
+
+
 
 (defun zhihu--cached-topic-completions (query)
   "返回 QUERY 的话题补全结果，并在当前 buffer 中缓存。"
@@ -4722,7 +4202,7 @@ CODE-RANGES 是预先收集并排序的代码区间。"
   (let* ((name (plist-get record :name))
          (quoted
          (pcase format
-            ('markdown (json-encode-string name))
+            ('org (json-encode-string name))
             ('typst (format "%S" name))
             (_ (error "zhihu: 不支持的话题补全源稿格式 %S"
                       format)))))
@@ -4767,77 +4247,24 @@ CODE-RANGES 是预先收集并排序的代码区间。"
        (zhihu--completion-session-finish
         session candidate status)))))
 
-(defun zhihu--user-mention-completion-source
-    (format user _suffix)
-  "把 USER 转成 FORMAT mention；_SUFFIX 被忽略。"
-  (zhihu--user-mention-source format user))
-
-(defun zhihu--markdown-user-mention-capf ()
-  "返回 Markdown 正文知乎用户 mention 的 CAPF 数据。"
-  (when-let* ((bounds
-              (zhihu--markdown-user-mention-bounds)))
-    (let* ((mention-start (car bounds))
-           (start (1+ mention-start))
-           (end (cdr bounds))
-           (query
-            (buffer-substring-no-properties start end)))
-      (unless (string-empty-p query)
-        (let* ((source-buffer (current-buffer))
-               (session
-                (zhihu--make-completion-session
-                 :source-buffer source-buffer
-                 :start-marker (copy-marker mention-start)
-                 :end-marker (copy-marker end t)
-                 :format 'markdown
-                 :seen (make-hash-table :test 'equal)
-                 :source-function
-                 #'zhihu--user-mention-completion-source))
-               (table
-                (zhihu--remote-completion-table
-                 (lambda (current)
-                   (or
-                    (when-let* ((entry
-                                (zhihu--completion-session-entry
-                                 session current)))
-                      (list entry))
-                    (when (buffer-live-p source-buffer)
-                      (with-current-buffer source-buffer
-                        (zhihu--completion-session-remember
-                         session
-                         (zhihu--user-completion-candidates
-                          (zhihu--cached-user-completions
-                           (substring-no-properties
-                            current))))))))
-                 'zhihu-user)))
-          (list
-           start end table
-           :exclusive t
-           :exit-function
-           (lambda (candidate status)
-             (zhihu--completion-session-finish
-              session candidate status))))))))
-
 ;;;###autoload
 (defun zhihu-completion-at-point ()
-  "补全知乎源稿的 metadata 字段、`column-id'、`topics' 和用户 mention。"
+  "补全知乎源稿的 metadata 字段、`column-id' 和 `topics'。"
   (save-restriction
     (widen)
     (or
-     (zhihu--markdown-metadata-key-capf)
      (zhihu--typst-metadata-key-capf)
      (when-let* ((info (zhihu--column-id-context)))
        (zhihu--column-id-capf info))
      (when-let* ((info (zhihu--topic-item-context)))
-       (zhihu--topic-capf info))
-     (zhihu--markdown-user-mention-capf))))
+       (zhihu--topic-capf info)))))
 
 (defun zhihu--source-editing-format ()
   "返回当前 buffer 可由 `zhihu-mode' 编辑的源稿格式。"
   (when buffer-file-name
     (pcase (zhihu--file-format buffer-file-name)
-      ('markdown
-       (and (derived-mode-p 'markdown-mode)
-            'markdown))
+      ('org
+       (and (derived-mode-p 'org-mode) 'org))
       ('typst
        (and (derived-mode-p 'typst-ts-mode 'typst-mode)
             'typst)))))
@@ -4857,15 +4284,13 @@ CODE-RANGES 是预先收集并排序的代码区间。"
   (kill-local-variable
    'zhihu--column-completion-cache)
   (kill-local-variable
-   'zhihu--user-mention-completion-cache)
-  (kill-local-variable
    'zhihu--topic-completion-cache))
 
 ;;;###autoload
 (define-minor-mode zhihu-mode
-  "在当前 Markdown 或 Typst 知乎源稿中启用编辑辅助。
-本 mode 提供 metadata 字段名、`column-id' 和 `topics' 补全；Markdown 还支持
-正文 `@QUERY' 用户补全。发布仍由 `zhihu-publish' 显式执行。"
+  "在当前 Org 或 Typst 知乎源稿中启用编辑辅助。
+本 mode 提供 metadata 字段名、`column-id' 和 `topics' 补全。发布仍由
+`zhihu-publish' 显式执行。"
   :init-value nil
   :lighter " 知"
   :keymap zhihu-mode-map
@@ -4875,7 +4300,7 @@ CODE-RANGES 是预先收集并排序的代码区间。"
         (setq zhihu-mode nil)
         (zhihu--disable-editing-support)
         (user-error
-         "zhihu: 当前 buffer 不是对应主模式的 Markdown 或 Typst 源稿"))
+         "zhihu: 当前 buffer 不是对应主模式的 Org 或 Typst 源稿"))
     (zhihu--disable-editing-support))
   (when zhihu-mode
     (zhihu--reset-completion-caches)
@@ -4984,7 +4409,7 @@ KEY/DATA 都是 string；内部按 unibyte 处理。"
 
 (defun zhihu--image-prefetch (md5-hex source)
   "POST /images，告诉服务端要传一张 hash 是 MD5-HEX 的图。
-SOURCE 是 \"answer\"、\"article\" 或 \"pin\"。返回 parsed JSON plist：
+SOURCE 是 \"answer\" 或 \"article\"。返回 parsed JSON plist：
   :upload_file (:image_id :object_key :state)  state=1 已存在 / state=2 待传
   :upload_token (:access_id :access_key :access_token :access_timestamp)"
   (let ((resp
@@ -5082,8 +4507,8 @@ OSS-USER-AGENT 必须与实际发送的 x-oss-user-agent 请求头一致。"
 (defun zhihu--upload-bytes (bytes mime source)
   "上传二进制图片，返回最终 picx URL。
 服务端按图片 MD5 去重；已有图片会走 state=1，不再 PUT 原始字节。"
-  (unless (member source '("answer" "article" "pin"))
-    (error "zhihu: 图片 source 必须是 answer、article 或 pin"))
+  (unless (member source '("answer" "article"))
+    (error "zhihu: 图片 source 必须是 answer 或 article"))
   (let* ((md5-hex (secure-hash 'md5 bytes))
          (pf (zhihu--image-prefetch md5-hex source))
          (file (plist-get pf :upload_file))
@@ -5205,7 +4630,7 @@ encoding 按 UTF-8 解码。HTTP(S) 及协议相对 URL 返回 `external'；
 (defun zhihu--rewrite-img-srcs (html base-dir source)
   "扫描 HTML 所有 <img>，按需上传。
 返回重写后的 HTML。SOURCE 透传给 `zhihu--upload-bytes'，必须是
-\"answer\"、\"article\" 或 \"pin\"。"
+\"answer\" 或 \"article\"。"
   (let* ((dom (zhihu--parse-html (concat "<html><body>" html "</body></html>")))
          (hosted 0)
          (skipped 0))
@@ -5225,326 +4650,6 @@ encoding 按 UTF-8 解码。HTTP(S) 及协议相对 URL 返回 `external'；
       (message "zhihu: 图片 %d 托管 / %d 外链跳过"
                hosted skipped)
       (zhihu--inner-html body))))
-
-(defconst zhihu--pin-image-limit 18
-  "知乎想法编辑器当前允许的图片数上限。")
-
-(defconst zhihu--pin-title-limit 50
-  "知乎想法编辑器当前允许的标题长度上限。")
-
-(defconst zhihu--pin-text-limit 2000
-  "知乎想法编辑器当前允许的正文文字长度上限。")
-
-(defun zhihu--bytes-u16-be (bytes offset)
-  "从 BYTES 的 OFFSET 读取一个 big-endian uint16。"
-  (unless (<= (+ offset 2) (length bytes))
-    (error "zhihu: 图片数据意外结束"))
-  (+ (ash (aref bytes offset) 8)
-     (aref bytes (1+ offset))))
-
-(defun zhihu--bytes-u16-le (bytes offset)
-  "从 BYTES 的 OFFSET 读取一个 little-endian uint16。"
-  (unless (<= (+ offset 2) (length bytes))
-    (error "zhihu: 图片数据意外结束"))
-  (+ (aref bytes offset)
-     (ash (aref bytes (1+ offset)) 8)))
-
-(defun zhihu--bytes-u24-le (bytes offset)
-  "从 BYTES 的 OFFSET 读取一个 little-endian uint24。"
-  (unless (<= (+ offset 3) (length bytes))
-    (error "zhihu: 图片数据意外结束"))
-  (+ (aref bytes offset)
-     (ash (aref bytes (1+ offset)) 8)
-     (ash (aref bytes (+ offset 2)) 16)))
-
-(defun zhihu--bytes-u32-be (bytes offset)
-  "从 BYTES 的 OFFSET 读取一个 big-endian uint32。"
-  (unless (<= (+ offset 4) (length bytes))
-    (error "zhihu: 图片数据意外结束"))
-  (+ (ash (aref bytes offset) 24)
-     (ash (aref bytes (1+ offset)) 16)
-     (ash (aref bytes (+ offset 2)) 8)
-     (aref bytes (+ offset 3))))
-
-(defun zhihu--bytes-u32-le (bytes offset)
-  "从 BYTES 的 OFFSET 读取一个 little-endian uint32。"
-  (unless (<= (+ offset 4) (length bytes))
-    (error "zhihu: 图片数据意外结束"))
-  (+ (aref bytes offset)
-     (ash (aref bytes (1+ offset)) 8)
-     (ash (aref bytes (+ offset 2)) 16)
-     (ash (aref bytes (+ offset 3)) 24)))
-
-(defun zhihu--jpeg-dimensions (bytes)
-  "从 JPEG BYTES 返回 (WIDTH . HEIGHT)，无法识别时返回 nil。"
-  (when (and (>= (length bytes) 4)
-             (= (aref bytes 0) #xff)
-             (= (aref bytes 1) #xd8))
-    (let ((offset 2)
-          dimensions)
-      (while (and (not dimensions) (< offset (length bytes)))
-        (while (and (< offset (length bytes))
-                    (/= (aref bytes offset) #xff))
-          (cl-incf offset))
-        (while (and (< offset (length bytes))
-                    (= (aref bytes offset) #xff))
-          (cl-incf offset))
-        (when (< offset (length bytes))
-          (let ((marker (aref bytes offset)))
-            (cl-incf offset)
-            (cond
-             ((or (= marker #xd8)
-                  (= marker #x01)
-                  (and (>= marker #xd0) (<= marker #xd7))))
-             ((or (= marker #xd9) (= marker #xda))
-              (setq offset (length bytes)))
-             ((> (+ offset 2) (length bytes))
-              (setq offset (length bytes)))
-             (t
-              (let ((segment-length
-                     (zhihu--bytes-u16-be bytes offset)))
-                (if (or (< segment-length 2)
-                        (> (+ offset segment-length) (length bytes)))
-                    (setq offset (length bytes))
-                  (when (and
-                         (memq marker
-                               '(#xc0 #xc1 #xc2 #xc3
-                                 #xc5 #xc6 #xc7
-                                 #xc9 #xca #xcb
-                                 #xcd #xce #xcf))
-                         (>= segment-length 7))
-                    (setq dimensions
-                          (cons
-                           (zhihu--bytes-u16-be bytes (+ offset 5))
-                           (zhihu--bytes-u16-be bytes (+ offset 3)))))
-                  (cl-incf offset segment-length))))))))
-      dimensions)))
-
-(defun zhihu--webp-dimensions (bytes)
-  "从 WebP BYTES 返回 (WIDTH . HEIGHT)，无法识别时返回 nil。"
-  (when (and (>= (length bytes) 20)
-             (equal (substring bytes 0 4) "RIFF")
-             (equal (substring bytes 8 12) "WEBP"))
-    (let ((offset 12)
-          dimensions)
-      (while (and (not dimensions)
-                  (<= (+ offset 8) (length bytes)))
-        (let* ((kind (substring bytes offset (+ offset 4)))
-               (size (zhihu--bytes-u32-le bytes (+ offset 4)))
-               (data (+ offset 8))
-               (end (+ data size)))
-          (if (> end (length bytes))
-              (setq offset (length bytes))
-            (cond
-             ((and (equal kind "VP8X") (>= size 10))
-              (setq dimensions
-                    (cons
-                     (1+ (zhihu--bytes-u24-le bytes (+ data 4)))
-                     (1+ (zhihu--bytes-u24-le bytes (+ data 7))))))
-             ((and (equal kind "VP8 ")
-                   (>= size 10)
-                   (= (aref bytes (+ data 3)) #x9d)
-                   (= (aref bytes (+ data 4)) #x01)
-                   (= (aref bytes (+ data 5)) #x2a))
-              (setq dimensions
-                    (cons
-                     (logand
-                      (zhihu--bytes-u16-le bytes (+ data 6)) #x3fff)
-                     (logand
-                      (zhihu--bytes-u16-le bytes (+ data 8)) #x3fff))))
-             ((and (equal kind "VP8L")
-                   (>= size 5)
-                   (= (aref bytes data) #x2f))
-              (let ((b0 (aref bytes (1+ data)))
-                    (b1 (aref bytes (+ data 2)))
-                    (b2 (aref bytes (+ data 3)))
-                    (b3 (aref bytes (+ data 4))))
-                (setq dimensions
-                      (cons
-                       (1+ (+ b0 (ash (logand b1 #x3f) 8)))
-                       (1+ (+ (ash (logand b1 #xc0) -6)
-                              (ash b2 2)
-                              (ash (logand b3 #x0f) 10))))))))
-            (setq offset (+ end (% size 2))))))
-      dimensions)))
-
-(defun zhihu--image-dimensions (bytes mime)
-  "从图片 BYTES/MIME 返回 (WIDTH . HEIGHT)。
-想法媒体必须携带可靠宽高；当前原生解析 PNG、JPEG、GIF 和 WebP。"
-  (setq bytes (string-to-unibyte bytes))
-  (let ((dimensions
-         (cond
-          ((and
-            (>= (length bytes) 24)
-            (equal
-             (substring bytes 0 8)
-             (unibyte-string #x89 #x50 #x4e #x47 #x0d #x0a #x1a #x0a))
-            (equal (substring bytes 12 16) "IHDR"))
-           (cons (zhihu--bytes-u32-be bytes 16)
-                 (zhihu--bytes-u32-be bytes 20)))
-          ((and (>= (length bytes) 10)
-                (member (substring bytes 0 6) '("GIF87a" "GIF89a")))
-           (cons (zhihu--bytes-u16-le bytes 6)
-                 (zhihu--bytes-u16-le bytes 8)))
-          ((zhihu--jpeg-dimensions bytes))
-          ((zhihu--webp-dimensions bytes)))))
-    (unless (and dimensions
-                 (integerp (car dimensions))
-                 (integerp (cdr dimensions))
-                 (> (car dimensions) 0)
-                 (> (cdr dimensions) 0))
-      (error
-       "zhihu: 无法从 %s 图片取得想法媒体所需的宽高；\
-想法图片目前支持 PNG、JPEG、GIF 和 WebP"
-       mime))
-    dimensions))
-
-(defun zhihu--pin-html-text-length (html)
-  "按知乎网页端算法返回想法 HTML 的 textLength。
-网页端先用非跨行的惰性 tag regexp 删除标签，再用 `Array.from' 统计
-Unicode code point；HTML entity 不会在这一步解码。"
-  (length (replace-regexp-in-string "<.+?>" "" html t t)))
-
-(defun zhihu--pin-equation-image-p (node)
-  "NODE 是否是本包生成的知乎原生 `eeimg' 公式节点。"
-  (and (consp node)
-       (eq (dom-tag node) 'img)
-       (member (dom-attr node 'eeimg) '("1" "2"))
-       (let ((src (dom-attr node 'src)))
-         (and (stringp src)
-              (string-prefix-p
-               "//www.zhihu.com/equation?tex=" src)))))
-
-(defun zhihu--pin-media-image-p (node)
-  "NODE 是否应从想法正文抽出并作为照片 media 发布。"
-  (and (consp node)
-       (eq (dom-tag node) 'img)
-       (not (zhihu--pin-equation-image-p node))))
-
-(defun zhihu--pin-html-without-media-images (node)
-  "复制 DOM NODE，并从正文抽出照片。
-照片的非空 `data-caption' 会在原位置降级为普通文字；由此变空的普通
-wrapper 会删除。知乎原生 `eeimg' 公式节点属于正文语义，会原样保留。"
-  (cond
-   ((stringp node) node)
-   ((not (consp node)) node)
-   ((zhihu--pin-media-image-p node)
-    (let* ((caption (dom-attr node 'data-caption))
-           (normalized
-            (and
-             (stringp caption)
-             (zhihu--normalize-caption-text caption))))
-      (and
-       normalized
-       (not (string-empty-p normalized))
-       normalized)))
-   (t
-    (let* ((tag (dom-tag node))
-           (children
-            (delq nil
-                  (mapcar
-                   #'zhihu--pin-html-without-media-images
-                   (dom-children node))))
-           (significant
-            (cl-some
-             (lambda (child)
-               (or (consp child)
-                   (and (stringp child)
-                        (not (string-empty-p (string-trim child))))))
-             children)))
-      (unless (and (memq tag '(a figcaption figure p picture span))
-                   (not significant))
-        (cons tag
-              (cons (copy-tree (dom-attributes node))
-                    children)))))))
-
-(defun zhihu--pin-image-candidate (img base-dir)
-  "把 IMG 预检成想法图片候选；本地路径以 BASE-DIR 为根。"
-  (let ((src (dom-attr img 'src)))
-    (unless (and (stringp src) (not (string-empty-p src)))
-      (error "zhihu: <img> 缺少非空 src"))
-    (let ((image (zhihu--img-bytes-and-mime src base-dir)))
-      (when (eq image 'external)
-        (error
-         "zhihu: 想法图片必须是本地路径或 data URL，以便取得可靠宽高：%s"
-         src))
-      (let* ((mime (car image))
-             (bytes (cdr image))
-             (dimensions (zhihu--image-dimensions bytes mime)))
-        (list :mime mime
-              :bytes bytes
-              :width (car dimensions)
-              :height (cdr dimensions))))))
-
-(defun zhihu--pin-media-from-candidate (candidate)
-  "上传 CANDIDATE，并返回一个想法 media object。"
-  (let ((url
-         (zhihu--upload-bytes
-          (plist-get candidate :bytes)
-          (plist-get candidate :mime)
-          "pin")))
-    `(:image
-      (:height ,(plist-get candidate :height)
-       :width ,(plist-get candidate :width)
-       :url ,url
-       :originalUrl ,url))))
-
-(defun zhihu--pin-content-from-html (html base-dir)
-  "把 HTML 转成想法正文与独立图片媒体。
-返回 `(:html HTML :text-length N :medias VECTOR)'。普通 `<img>' 会从
-HTML 删除，按原顺序上传并写入 MEDIAS；知乎 `eeimg' 公式留在正文。
-外链照片和链接卡片会明确拒绝。"
-  (let* ((dom (zhihu--parse-html (concat "<html><body>" html "</body></html>")))
-         (body (car (dom-by-tag dom 'body)))
-         (images
-          (cl-remove-if-not
-           #'zhihu--pin-media-image-p
-           (dom-by-tag body 'img))))
-    (when
-        (cl-find-if
-         (lambda (node)
-           (equal (dom-attr node 'data-draft-type) "link-card"))
-         (dom-by-tag body 'a))
-      (error "zhihu: 想法暂不支持正文链接卡片"))
-    (when (> (length images) zhihu--pin-image-limit)
-      (error "zhihu: 想法最多包含 %d 张图片" zhihu--pin-image-limit))
-    (let* ((clean-body (zhihu--pin-html-without-media-images body))
-           (visible-text
-            (string-trim
-             (if clean-body
-                 (dom-inner-text clean-body)
-               "")))
-           (clean-html
-            (if (and clean-body
-                     (or
-                      (not (string-empty-p visible-text))
-                      (cl-find-if
-                       #'zhihu--pin-equation-image-p
-                       (dom-by-tag clean-body 'img))))
-                (zhihu--inner-html clean-body)
-              ""))
-           (text-length (zhihu--pin-html-text-length clean-html)))
-      (when (> text-length zhihu--pin-text-limit)
-        (error "zhihu: 想法正文最多 %d 个字符（当前 %d）"
-               zhihu--pin-text-limit text-length))
-      ;; 所有图片先完成本地解析和尺寸检查，再发起任何上传。
-      (let* ((candidates
-              (mapcar
-               (lambda (img)
-                 (zhihu--pin-image-candidate img base-dir))
-               images))
-             (medias
-              (vconcat
-               (mapcar
-                (lambda (candidate)
-                  (zhihu--pin-media-from-candidate candidate))
-                candidates))))
-        (when (and (zerop text-length)
-                   (zerop (length medias)))
-          (error "zhihu: 想法正文和图片不能同时为空"))
-        (list :html clean-html
-              :text-length text-length
-              :medias medias)))))
 
 ;;;; Publishing
 
@@ -6177,7 +5282,7 @@ OFFSET 和 INDEX 只用于定位畸形响应。"
 (defun zhihu--resolve-comment-permission
     (value &optional allowed-values)
   "解析评论权限 VALUE，并在缺失时使用全局默认值。
-ALLOWED-VALUES 缺省为回答/文章使用的枚举；想法可传自己的扩展枚举。"
+ALLOWED-VALUES 缺省为回答/文章使用的枚举。"
   (setq allowed-values
         (or allowed-values zhihu--comment-permission-api-values))
   (or
@@ -6379,110 +5484,6 @@ QUESTION-ID 非 nil 时写入 extra_info；HTML 非 nil 时加入回答正文。
             :data ,(zhihu--publish-data settings draft))))
     (zhihu--publish-request body :xsrf-state xsrf-state)))
 
-(defun zhihu--uuid-v4 ()
-  "生成小写 RFC 4122 version 4 UUID 字符串。"
-  (let ((bytes (make-vector 16 0)))
-    (dotimes (index 16)
-      (aset bytes index (random 256)))
-    (aset bytes 6 (logior #x40 (logand (aref bytes 6) #x0f)))
-    (aset bytes 8 (logior #x80 (logand (aref bytes 8) #x3f)))
-    (let ((hex
-           (mapconcat
-            (lambda (byte) (format "%02x" byte))
-            (append bytes nil)
-            "")))
-      (format "%s-%s-%s-%s-%s"
-              (substring hex 0 8)
-              (substring hex 8 12)
-              (substring hex 12 16)
-              (substring hex 16 20)
-              (substring hex 20 32)))))
-
-(defun zhihu--pin-trace-id ()
-  "按当前知乎网页端格式生成想法发布 trace ID。"
-  (format "%d,%s"
-          (floor (* 1000 (float-time)))
-          (zhihu--uuid-v4)))
-
-(defun zhihu--normalize-pin-title (title)
-  "归一化想法 TITLE，并执行网页端长度限制。"
-  (let ((title (zhihu--normalize-metadata-string "title" title)))
-    (when (and title
-               (> (length title) zhihu--pin-title-limit))
-      (error "zhihu: 想法标题最多 %d 个字符"
-             zhihu--pin-title-limit))
-    title))
-
-(defun zhihu--pin-topic-data (topics)
-  "把 TOPICS 名称解析成想法发布 payload 使用的 JSON array。"
-  (setq topics
-        (zhihu--normalize-metadata-topics
-         topics zhihu--pin-topic-limit "想法"))
-  (vconcat
-   (mapcar
-    (lambda (name)
-      (let* ((record (zhihu--resolve-article-topic name))
-             (id (zhihu--value-string (plist-get record :id))))
-        (unless id
-          (error "zhihu: 话题 %S 缺少可发布的 topic ID" name))
-        `(:topic_id ,id :topic_name ,(format "#%s#" name))))
-    topics)))
-
-(cl-defun zhihu--publish-pin
-    (pin-id title content topics
-            &key comment-permission trace-id)
-  "发布想法并返回服务端确认的 pin ID。
-PIN-ID 非 nil 时更新已有想法。CONTENT 是
-`zhihu--pin-content-from-html' 的返回值；TOPICS 是
-`zhihu--pin-topic-data' 生成的 vector。"
-  (setq pin-id (zhihu--normalize-metadata-id-string "thought-id" pin-id)
-        title (zhihu--normalize-pin-title title))
-  (unless (and (listp content)
-               (stringp (plist-get content :html))
-               (integerp (plist-get content :text-length))
-               (>= (plist-get content :text-length) 0)
-               (vectorp (plist-get content :medias)))
-    (error "zhihu: 想法正文转换结果无效"))
-  (unless (and (vectorp topics)
-               (<= (length topics) zhihu--pin-topic-limit))
-    (error "zhihu: 想法话题 payload 无效"))
-  (let* ((html (plist-get content :html))
-         (text-length (plist-get content :text-length))
-         (medias (plist-get content :medias))
-         (comment-permission
-          (zhihu--resolve-comment-permission
-           comment-permission
-           zhihu--pin-comment-permission-api-values))
-         (draft
-          `(:disabled 1
-            ,@(when pin-id
-                (list :id pin-id :isPublished t))))
-         (data
-          `(:publish (:traceId ,(or trace-id (zhihu--pin-trace-id)))
-            :commentsPermission
-            (:comment_permission ,comment-permission)
-            :extra_info (:view_permission "all" :publisher "pc")
-            :draft ,draft
-            ,@(when title
-                (list :title `(:title ,title)))
-            ,@(unless (string-empty-p html)
-                (list :hybrid
-                      `(:html ,html :textLength ,text-length)))
-            ,@(when (> (length medias) 0)
-                (list :media `(:medias ,medias)))
-            ,@(when (> (length topics) 0)
-                (list :topic `(:topics ,topics)))))
-         (body `(:action "pin" :data ,data)))
-    (unless (= text-length (zhihu--pin-html-text-length html))
-      (error "zhihu: 想法正文 textLength 与 HTML 不一致"))
-    (when (> text-length zhihu--pin-text-limit)
-      (error "zhihu: 想法正文长度超过 %d" zhihu--pin-text-limit))
-    (when (> (length medias) zhihu--pin-image-limit)
-      (error "zhihu: 想法图片数超过 %d" zhihu--pin-image-limit))
-    (when (and (zerop text-length) (zerop (length medias)))
-      (error "zhihu: 想法正文和图片不能同时为空"))
-    (zhihu--publish-request body)))
-
 ;; Source creation
 
 (defun zhihu--question-title (question-id)
@@ -6523,7 +5524,8 @@ PIN-ID 非 nil 时更新已有想法。CONTENT 是
       (user-error "zhihu: 新建源稿不支持远程路径"))
     (unless (and format (not (file-directory-p file)))
       (user-error
-       "zhihu: 源稿目标必须是使用 .typ、.md 或 .markdown 扩展名的文件路径：%s"
+       (concat
+        "zhihu: 源稿目标必须是使用 .typ 或 .org 扩展名的文件路径：%s")
        file))
     (when (or (string-empty-p stem)
               (member stem '("." ".."))
@@ -6551,16 +5553,15 @@ PIN-ID 非 nil 时更新已有想法。CONTENT 是
           (format "#set document(title: %S)\n\n" title)
           (when toc
             "#outline()\n\n"))))
-      (markdown
+      (org
        (concat
-        "---\n"
-        (format "title: %s\n" (json-serialize title))
+        (format "#+TITLE: %s\n" title)
         (when banner
-          (format "banner: %s\n" (json-serialize banner)))
+          (format "#+BANNER: %s\n" banner))
         (when toc
-          "toc: true\n")
-        (zhihu--format-zhihu-yaml meta)
-        "---\n\n")))))
+          "#+TOC: headlines 2\n")
+        (zhihu--format-org-zhihu-metadata meta)
+        "\n")))))
 
 (defun zhihu--create-source-file (file meta)
   "按 META 创建 FILE；目标路径已被占用时拒绝覆盖。"
@@ -6572,7 +5573,6 @@ PIN-ID 非 nil 时更新已有想法。CONTENT 是
               ('answer
                (zhihu--question-title (plist-get meta :question-id)))
               ('article (or (plist-get meta :title) ""))
-              ('pin (or (plist-get meta :title) ""))
               (kind (error "zhihu: 未知 metadata kind: %S" kind))))
            (source-meta
             (plist-put (copy-sequence meta) :title source-title))
@@ -6593,7 +5593,7 @@ PIN-ID 非 nil 时更新已有想法。CONTENT 是
 对应问题的标题会成为初始文档标题；创建后显式启用 `zhihu-mode'。"
   (interactive
    (list (read-string "知乎问题 ID 或 URL: ")
-         (read-file-name "源稿文件（.typ/.md/.markdown）: "
+         (read-file-name "源稿文件（.typ/.org）: "
                          default-directory nil nil)))
   (let ((meta
          (zhihu--zhihu-meta-from-plist
@@ -6663,8 +5663,7 @@ ID；知乎将申请转入人工审核时返回 `pending'。"
 (defun zhihu--package-publish-content (kind html base-dir)
   "按 KIND 打包已经统一转换完成的知乎 HTML。
 HTML 在进入本函数前已经是共同的知乎方言。回答和文章上传正文图片并重写
-地址；文章另加可选的 CC 声明。想法只把普通照片移入独立媒体列表，公式等
-正文节点仍保留在 HTML。BASE-DIR 用于解析相对图片路径。
+地址；文章另加可选的 CC 声明。BASE-DIR 用于解析相对图片路径。
 返回值至少包含 `:html'。"
   (pcase kind
     ('answer
@@ -6676,8 +5675,6 @@ HTML 在进入本函数前已经是共同的知乎方言。回答和文章上传
       :html
       (zhihu--append-article-cc-statement
        (zhihu--rewrite-img-srcs html base-dir "article"))))
-    ('pin
-     (zhihu--pin-content-from-html html base-dir))
     (_
      (error "zhihu: 不支持的发布内容类型：%S" kind))))
 
@@ -6707,41 +5704,6 @@ HTML 在进入本函数前已经是共同的知乎方言。回答和文章上传
       (zhihu--checkpoint-meta file meta))
     (message "zhihu: 已发布 question/%s/answer/%s" qid aid)
     aid))
-
-(defun zhihu--publish-pin-file (file meta)
-  "编译并发布 FILE 对应的想法 META，返回 pin ID。"
-  (let* ((thought-id (plist-get meta :thought-id))
-         (newly-created (null thought-id))
-         (base-dir (file-name-directory (expand-file-name file)))
-         (document
-          (zhihu--compile-source-document
-           file (plist-get meta :title)
-           #'zhihu--normalize-pin-title))
-         (title (plist-get document :title))
-         (topic-data
-          (progn
-            (when (plist-get meta :topics)
-              (message "zhihu: 解析想法话题..."))
-            (zhihu--pin-topic-data (plist-get meta :topics))))
-         (content
-          (zhihu--package-publish-content
-           'pin (plist-get document :html) base-dir)))
-    (setq meta (copy-sequence meta))
-    (message "zhihu: 发布中...")
-    (let ((published-id
-           (zhihu--publish-pin
-            thought-id title content topic-data
-            :comment-permission
-            (plist-get meta :comment-permission))))
-      (when (and thought-id (not (equal thought-id published-id)))
-        (error "zhihu: 更新想法 %s 后服务端返回了不同 ID：%s"
-               thought-id published-id))
-      (setq thought-id published-id))
-    (when newly-created
-      (setq meta (plist-put meta :thought-id thought-id))
-      (zhihu--checkpoint-meta file meta))
-    (message "zhihu: 已发布 pin/%s" thought-id)
-    thought-id))
 
 (defun zhihu--publish-article-file (xsrf-state file meta)
   (let* ((aid (plist-get meta :article-id))
@@ -6845,7 +5807,7 @@ column-id 已保留，再次发布即可重试"
 
 ;;;###autoload
 (defun zhihu-publish ()
-  "保存并发布当前回答、文章或想法源稿。"
+  "保存并发布当前回答或文章源稿。"
   (interactive)
   (message "zhihu: 开始发布...")
   (redisplay)
@@ -6859,12 +5821,11 @@ column-id 已保留，再次发布即可重试"
     (let ((meta (zhihu--read-source-meta file)))
       (pcase (plist-get meta :kind)
         ('answer (zhihu--publish-answer-file file meta))
-        ('pin (zhihu--publish-pin-file file meta))
         ('article
          (zhihu--publish-article-file
           (zhihu--make-xsrf-state)
           file meta))
-        (_ (user-error "zhihu: metadata 没有指定回答、文章或想法"))))))
+        (_ (user-error "zhihu: metadata 没有指定回答或文章"))))))
 
 (provide 'zhihu)
 ;;; zhihu.el ends here

@@ -18,7 +18,7 @@
 
 ```mermaid
 flowchart TD
-    A[Typst / Markdown 源稿] --> B[读取知乎 metadata]
+    A[Typst / Org 源稿] --> B[读取知乎 metadata]
     B --> C[编译并转换为知乎 HTML]
     C --> D[扫描本地 / data 图片]
     D --> E[每张图片都调用知乎预取]
@@ -376,24 +376,22 @@ HTTP 2xx 后仍要检查顶层 `payload` 中明确存在的 `manualCensor`（兼
 
 - `question-id`、`answer-id`；
 - `article-id`、`column-id`；
-- `thought-id`；
-- 文章或想法话题 `topics`；
+- 文章话题 `topics`；
 - 按篇发布设置 `creation-statement`、`reprint-permission` 和
   `comment-permission`；
 - 文档标题、通用题图源路径 `banner` 和通用目录请求。
 
 回答字段与文章字段不能混用。通用 `banner` 不参与稿件类型判定，因此也可以
-存在于回答源稿中；`toc` 同样不参与类型判定。知乎回答与想法发布流程不会
+存在于回答源稿中；`toc` 同样不参与类型判定。知乎回答发布流程不会
 使用这两个字段。
 
 所有知乎 metadata 字段都严格区分“缺失”和“显式空值”：只有字段缺失才采用
-默认语义；字段一旦出现，就必须是非空且类型、取值有效的值。Typst 的 `none`、
-YAML 的 `null` 和空字符串都是格式错误。布尔值 `false` 是有效值，不会与
-null 混为一谈。
+默认语义；字段一旦出现，就必须是非空且类型、取值有效的值。Typst 的 `none`
+和空字符串都是格式错误。布尔值 `false` 是有效值，不会与空值混为一谈。
 
-`question-id`、`article-id` 与 `thought-id` 是三个互斥的类型判据，必须且只能
-出现一个。`question-id` 不能为空；新文章和新想法则分别保留空的
-`article-id` 或 `thought-id` 槽，首次发布成功后写回服务端 ID。回答的
+`question-id` 与 `article-id` 是两个互斥的类型判据，必须且只能
+出现一个。`question-id` 不能为空；新文章保留空的 `article-id` 槽，首次
+发布成功后写回服务端 ID。回答的
 `answer-id` 不参与类型判定，只在已有回答或首次发布成功后出现。
 
 标题、题图和目录设置属于文档本身，不属于 `<zhihu>` 发布状态：
@@ -401,7 +399,7 @@ null 混为一谈。
 | 格式 | 文档标题 | 通用题图 | 通用目录设置 | 知乎同步状态 |
 | --- | --- | --- | --- | --- |
 | Typst | `#set document(title: ...)` | `#metadata("path") <banner>` | `#outline()` | `#metadata((...)) <zhihu>` |
-| Markdown | YAML 顶层 `title` | YAML 顶层 `banner` | YAML 顶层 `toc: true` | YAML 的 `zhihu` mapping |
+| Org | `#+TITLE:` | `#+BANNER:` | `#+TOC: headlines N` | `#+ZHIHU_*:` 关键字 |
 
 三个按篇设置的语义如下：
 
@@ -414,28 +412,27 @@ null 混为一谈。
 `banner` 是通用文档字段，值必须是非空字符串。知乎仅在发布文章时把它解释为
 本地图片路径；相对路径以源稿目录为基准，HTTP(S)、协议相对 URL 和 data URL
 都会报错。它采用声明式语义：字段存在时设置或替换文章封面，字段缺失时通过
-`titleImage = ""` 明确清除知乎上的现有封面。旧的 Markdown 顶层 `cover` 和
-Typst `<cover>` 不会被读取；`zhihu.banner` 和 Typst `<zhihu>` dictionary
-内的 `banner` 也完全忽略。
+`titleImage = ""` 明确清除知乎上的现有封面。Typst `<cover>` 不会被读取；
+Typst `<zhihu>` dictionary 内的 `banner` 也完全忽略。
 不存在兼容或回退优先级。
 
-目录请求属于通用文档结构。Markdown 使用 YAML 顶层布尔值 `toc: true`；
-Typst 使用原生 `#outline()`，也可写成 `#outline(depth: 2)`。只有文章发布流程
+目录请求属于通用文档结构。Org 使用 `#+TOC: headlines N`；Typst 使用原生
+`#outline()`，也可写成
+`#outline(depth: 2)`。只有文章发布流程
 读取目录请求，并映射为知乎原生文章
-目录；回答和想法会忽略它。Typst 中，只有以 `heading`（包括
+目录；回答会忽略它。Typst 中，只有以 `heading`（包括
 `heading.where(...)`）为 target 的 outline 才作为文章目录开关；编译 HTML
 前，临时 Typst wrapper 会通过 show rule 隐藏该 heading outline，以免与知乎
 原生目录重复，原稿本身不会修改。以 `figure` 等非 heading 元素为 target 的
-outline 不会启用文章目录，并会保留在发布正文中。没有目录请求，或 Markdown
-的 `toc` 为 `false` 时关闭目录。
+outline 不会启用文章目录，并会保留在发布正文中。没有目录请求时关闭目录。
 
-`topics` 允许用于文章和想法，值是互不重复的话题名称 sequence；
-文章至多三个，想法至多十个。Markdown 使用 YAML sequence，Typst 使用
-string tuple。文章字段缺失表示本地空集合，
-发布时会解绑远端全部话题；想法字段缺失时不发送话题 payload。
+`topics` 只允许用于文章，值是至多三个互不重复的话题名称。Org 使用 JSON
+array，Typst 使用 string tuple。字段缺失表示
+本地空集合，发布时会解绑远端全部话题。
 显式空 sequence 仍是格式错误，清空时应删除整个字段。
 
-Typst 和 Markdown 使用上表中的原字段名。
+Typst 使用上表中的原字段名；Org 使用 `ZHIHU_` 前缀、大写字母
+和下划线。
 `creation-statement` 没有全局默认值，填写时直接使用 API 类型，不经过一层
 包内名称映射。
 
@@ -447,7 +444,7 @@ Typst 和 Markdown 使用上表中的原字段名。
 
 - Typst 从编译后 HTML 的 `<title>` 读取，也就是由
   `#set document(title: ...)` 统一管理；
-- Markdown 从 YAML 顶层 `title` 读取；
+- Org 从 `#+TITLE:` 读取；
 
 新文章源稿必须填写文档标题；发布时标题为空会明确报错。
 
@@ -468,42 +465,44 @@ Typst：
    heading 层级。Typst 的 HTML 导出已为文档标题保留 `h1`，一级正文
    heading 从 `h2` 开始。
 
-Markdown：
+Org：
 
-1. 先剥掉 YAML frontmatter；
-2. 用 Pandoc 从显式启用 `alerts` 的 `gfm` 转为 HTML5；默认把正文 heading
-   整体下移一级。
+1. Emacs 内置的 `ox-html` 读取完整源稿并导出 body fragment；导出时关闭
+   Babel 执行、自动目录和章节编号，显式 `#+TOC:` 仍然生效；
+2. 在 HTML 层把 ox 的脚注改写为知乎引用 marker，把数学包装成通用
+   `.math` span，并移除仅用于页面布局的 outline/source wrapper；
+3. 结果直接进入共用的知乎 HTML 方言转换，不再由 Pandoc 读取或解释；
+4. 文档级 `#+TITLE:` 只作为本地标题；一级正文标题由 ox 固定映射为 `h2`，
+   并保留 `CUSTOM_ID` 供文章内链接使用。
 
-每次 Pandoc 转换都会加载由包内代码生成的临时 Lua filter，用于引用节点以及
-Markdown alerts。临时 filter 在转换完成或报错后都会删除，不要求安装额外的
-Lua 文件。
+Typst 的脚注在进入 Pandoc 前由其 HTML 结构改写；Org 完全走 ox-html 与共用
+HTML 层，不再由 Pandoc 读取或解释。
 
 链接卡片直接使用 Microformats2 `h-cite` HTML：根节点带 `h-cite` class，
 其中恰好包含一个 `u-url` 和一个非空 `p-name`。`u-url` 必须是带 host 的
 HTTP(S) `<a>`。卡片必须是文档顶层的独立内容；转换器把它改为知乎原生 block
-`link-card`。Markdown 可嵌入 raw HTML，Typst 可用 `html.elem` 输出同一结构。
+`link-card`。Org 使用 HTML export block，Typst
+可用 `html.elem` 输出同一结构。
 
-分割线不需要 Lua filter。Markdown 正文的 `---` 由 Pandoc 转成 `<hr>`。
-Typst 0.15 起使用原生 `divider()`：在
+用户 mention 只通过显式的 `zhihu-insert-user-mention` 生成。命令搜索用户后，
+在 Org 或 Typst 中写入带 `member_mention_HASH` title 的链接；共用 HTML 转换层
+把它改成带 `class="member_mention"`、`data-hash` 和用户 href 的知乎原生链接。
+普通用户主页链接不会隐式升级。
+
+分割线不需要额外转换规则。Typst 0.15 起使用原生 `divider()`：在
 PDF 等分页输出中渲染为水平线，在 HTML 中直接输出 `<hr>`。
-
-Markdown 的偏移由 Customize 选项
-`zhihu-enable-markdown-heading-level-shift` 控制；设为 `nil` 时保留源稿的
-自然标题层级。Typst 的 HTML 导出已经区分文档标题与正文 heading，不读取
-该选项。
 
 之后两种格式都进入同一套知乎 HTML 方言转换：
 
-- Pandoc 的数学 `.math` span 变成知乎 equation `<img>`；
+- ox-html 适配层或 Typst 规范化产生的 `.math` span 变成知乎 equation `<img>`；
 - 代码块归一成带 `lang` 的 `<pre>`；
 - 删除 `style` 属性；
 - 为 table 增加知乎编辑器需要的 `data-draft-*` 属性；
 - 把严格校验后的 `h-cite` 转成 block `link-card` 属性；
 
-默认设置下，两种源稿都把各自的一级语法（Typst `=`、Markdown `#`）作为正文
-顶层章节，发布后成为 `h2`；下一级成为 `h3`。关闭 Markdown
-标题偏移后，只有 Markdown 分别保留为 `h1`、`h2`。标题层级在进入通用知乎
-HTML 方言转换前已经确定，通用转换不再单独改写 `h1`。
+两种源稿都把各自的一级语法（Typst `=`、Org `*`）作为正文顶层章节，发布后
+成为 `h2`；下一级成为 `h3`。标题层级在进入通用知乎 HTML 方言转换前已经
+确定，通用转换不再单独改写 `h1`。
 
 ## 八、图片上传
 
@@ -572,9 +571,9 @@ article draft PATCH 的 `titleImage`；
 这里的 `isPublished` 表达请求所针对对象的既有状态，不应直译成“这一次是否
 执行发布”。新建内容仍然是在发布，只是该字段为 `false`。
 
-回答流程不会使用或发送解析到的源稿标题。Markdown frontmatter 会在正文
-转换前剥掉；Typst 的 document title 位于 HTML head。二者都不会成为知乎
-API 的回答 title 字段。
+回答流程不会使用或发送解析到的源稿标题。Typst 的 document title 位于 HTML
+head，Org 的 `#+TITLE:` 属于文档 metadata；二者都不会成为知乎 API 的回答
+title 字段。
 
 如果服务端实际创建了新回答，但客户端没有收到可验证的成功响应，源稿中仍
 没有 `answer-id`。当前代码没有足够的远端状态来自动找回这次创建，直接重试
@@ -635,8 +634,9 @@ article-id 非空 → 复用该 ID，PATCH 并发布
 
 ### 10.2 文章话题采用严格集合同步
 
-启用 `zhihu-mode` 后，在 Markdown `zhihu.topics` 的 sequence item，或 Typst `<zhihu>` dictionary
-中 `topics` tuple 的字符串元素内运行 `completion-at-point`。补全表按输入
+启用 `zhihu-mode` 后，在 Org 的 `#+ZHIHU_TOPICS:` JSON array 或 Typst
+`<zhihu>` dictionary 中 `topics` tuple 的字符串元素内运行
+`completion-at-point`。补全表按输入
 查询公开 autocomplete 端点，候选保留知乎的相关性顺序并显示简介与话题 ID；
 最终只把话题名写入当前元素，不改动外层引号、逗号和注释。空查询不请求网络，
 同一 buffer 内会按查询词缓存结果。
@@ -698,7 +698,7 @@ GET 返回相同 `column.id` 时，当前的“已收录状态”来自知乎文
 
 - 创作声明来自每篇稿件的 `creation-statement`。未填写时关闭声明并发送
   `disclaimer_type = none`；填写时打开声明并直接发送该 API 类型；
-- 目录来自源稿的通用目录请求，未填写时关闭；回答和想法忽略该请求；
+- 目录来自源稿的通用目录请求，未填写时关闭；回答忽略该请求；
 - 转载和评论可以由稿件的 `reprint-permission`、`comment-permission`
   覆盖；未填写时分别使用两个独立的 typed `defcustom`：
   `zhihu-publish-default-reprint-permission` 和
@@ -745,14 +745,14 @@ GET 返回相同 `column.id` 时，当前的“已收录状态”来自知乎文
 
 - Typst 只重写标准的 `#metadata((...)) <zhihu>` 块，不接管
   `#set document(title: ...)` 或 `#metadata("...") <banner>`；
-- Markdown 只替换 YAML frontmatter 中的 `zhihu` mapping。
+- Org 只替换文档级的 `#+ZHIHU_*:` 关键字。
 
 因此服务端 ID 的 checkpoint 不会新增、移动、改写或删除通用题图
 字段；即使运行时 plist 中的 `:banner` 为 nil，知乎状态 writer 也不会清除
 源稿题图。
 
-没有任何需要持久化的知乎状态时，相应的 Typst metadata 块或 Markdown
-`zhihu` mapping 会完全缺席，而不是保留空容器或空值。
+没有任何需要持久化的知乎状态时，相应的 Typst metadata 块或 Org 关键字会
+完全缺席，而不是保留空容器或空值。
 
 源稿中不会保存浏览器 Cookie、XSRF token 或 OSS 临时密钥。
 
