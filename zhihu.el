@@ -5,7 +5,7 @@
 ;; Author: Dzming Li <i@dzming.li>
 ;; Maintainer: Dzming Li <i@dzming.li>
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "31.1") (plz "0.10-pre"))
+;; Package-Requires: ((emacs "31.1") (browser-cookies "0.1.0") (plz "0.10-pre"))
 ;; Keywords: convenience, hypermedia, tools
 ;; URL: https://github.com/DzmingLi/zhihu.el
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -58,13 +58,13 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'browser-cookies)
 (require 'subr-x)
 (require 'url)
 (require 'url-util)
 (require 'json)
 (require 'dom)
 (require 'xml)
-(require 'sqlite)
 (require 'mailcap)
 (require 'plz)
 (require 'ox-html)
@@ -72,10 +72,6 @@
 (define-error
   'zhihu-create-result-unknown
   "无法确认知乎创建请求的结果")
-
-(declare-function secrets-search-item-paths "secrets"
-                  (collection &rest attributes))
-(declare-function secrets-get-secret "secrets" (collection item))
 
 (defgroup zhihu nil
   "在Emacs中编辑，同步和发布知乎文章"
@@ -136,9 +132,7 @@ CC 许可和 CC0 均不可撤销，启用前应确认自己拥有或控制相关
 ;;;; Cookies
 
 (defcustom zhihu-cookie-browser 'firefox
-  "提供知乎登录 Cookie 的浏览器。
-Firefox 直接读取 profile 的 SQLite 数据库；Chromium 系浏览器还会通过
-系统凭据存储取得 Cookie 解密密钥。"
+  "提供知乎登录 Cookie 的浏览器。"
   :type '(choice
           (const :tag "Firefox" firefox)
           (const :tag "Chromium" chromium)
@@ -147,10 +141,7 @@ Firefox 直接读取 profile 的 SQLite 数据库；Chromium 系浏览器还会�
   :group 'zhihu)
 
 (defcustom zhihu-cookie-profile-directory nil
-  "用于读取知乎 Cookie 的浏览器 profile 目录。
-必须显式设置；本包不会扫描或猜测 profile。Firefox 应指向包含
-cookies.sqlite 的目录，Chromium/Chrome/Edge 应指向包含 Network/Cookies
-的目录。"
+  "用于读取知乎 Cookie 的显式浏览器 profile 目录。"
   :type '(choice (const :tag "未配置" nil)
                  (directory :must-match t))
   :group 'zhihu)
@@ -160,12 +151,6 @@ cookies.sqlite 的目录，Chromium/Chrome/Edge 应指向包含 Network/Cookies
      (:constructor zhihu--make-xsrf-state (&optional xsrf-token)))
   "一次文章发布操作中的 `_xsrf' 状态。"
   xsrf-token)
-
-(cl-defstruct
-    (zhihu--cookie-record
-     (:constructor zhihu--make-cookie-record))
-  "从浏览器数据库读取、尚未按请求 URL 筛选的 Cookie。"
-  name value domain path expires secure creation)
 
 (cl-defstruct
     (zhihu--completion-session
@@ -179,648 +164,12 @@ cookies.sqlite 的目录，Chromium/Chrome/Edge 应指向包含 Network/Cookies
   seen
   source-function)
 
-(declare-function
- dbus-call-method "dbus"
- (bus service path interface method &rest args))
-
-(defconst zhihu--chromium-browser-specs
-  '((chromium
-     :secret-applications ("chromium")
-     :kwallet-folder "Chromium Keys"
-     :kwallet-key "Chromium Safe Storage")
-    (chrome
-     :secret-applications ("chrome")
-     :kwallet-folder "Chrome Keys"
-     :kwallet-key "Chrome Safe Storage")
-    (edge
-     :secret-applications ("chromium")
-     :kwallet-folder "Chromium Keys"
-     :kwallet-key "Chromium Safe Storage"))
-  "Chromium 系浏览器的系统凭据存储标识。")
-
-(defconst zhihu--chromium-linux-v10-key
-  (unibyte-string
-   #xfd #x62 #x1f #xe5 #xa2 #xb4 #x02 #x53
-   #x9d #xfa #x14 #x7c #xa9 #x27 #x27 #x78)
-  "Chromium Linux basic password store 的 AES-128 key。")
-
-(defconst zhihu--chromium-aes-cbc-iv
-  (encode-coding-string (make-string 16 ?\s) 'us-ascii t)
-  "Chromium v10/v11 AES-CBC 使用的固定 IV。")
-
-(defconst zhihu--chromium-time-epoch-offset 11644473600000000
-  "Unix epoch 之前的 Chromium 微秒数。")
-
-(defun zhihu--cookie-store-file (browser)
-  "返回 BROWSER 的显式 profile 中唯一的 Cookie 存储文件。"
-  (let* ((relative
-          (pcase browser
-            ('firefox "cookies.sqlite")
-            ((or 'chromium 'chrome 'edge) "Network/Cookies")
-            (_ (error "zhihu: 不支持的 Cookie 浏览器：%s" browser))))
-         (profile zhihu-cookie-profile-directory))
-    (unless (and (stringp profile)
-                 (not (string-empty-p (string-trim profile))))
-      (error
-       "zhihu: 请设置 zhihu-cookie-profile-directory；本包不会自动选择浏览器 profile"))
-    (setq profile (expand-file-name profile))
-    (unless (and (file-directory-p profile)
-                 (file-readable-p profile))
-      (error "zhihu: Cookie profile 目录不可读：%s" profile))
-    (let ((file (expand-file-name relative profile)))
-      (unless (and (file-regular-p file)
-                   (file-readable-p file))
-        (error "zhihu: Cookie profile 中缺少可读的 %s：%s"
-               relative profile))
-      file)))
-
-(defun zhihu--cookie-url-parts (url)
-  "解析 URL，返回 (HOST PATH SECURE)。
-URL 必须是带 host 的绝对 HTTP(S) URL。"
-  (let* ((parsed (url-generic-parse-url url))
-         (host (url-host parsed))
-         (scheme (downcase (or (url-type parsed) "")))
-         (filename (or (url-filename parsed) "/"))
-         (path (car (split-string filename "[?#]" t))))
-    (unless (and (stringp host) (not (string-empty-p host))
-                 (member scheme '("http" "https")))
-      (error "zhihu: 无法从 URL 读取浏览器 Cookie：%s" url))
-    (list (downcase host)
-          (if (and path (string-prefix-p "/" path)) path "/")
-          (string-equal scheme "https"))))
-
-(defun zhihu--cookie-domain-matches-p (domain host)
-  "返回 DOMAIN Cookie 是否适用于 HOST。"
-  (let ((domain (downcase domain))
-        (host (downcase host)))
-    (if (string-prefix-p "." domain)
-        (let ((bare (substring domain 1)))
-          (or (string-equal host bare)
-              (string-suffix-p (concat "." bare) host)))
-      (string-equal domain host))))
-
-(defun zhihu--cookie-domain-candidates (host)
-  "返回 HOST 可能匹配的浏览器 Cookie domain 候选。"
-  (let ((candidates (list host (concat "." host)))
-        (start 0))
-    (while (string-match "\\." host start)
-      (push (substring host (match-beginning 0)) candidates)
-      (setq start (match-end 0)))
-    (delete-dups candidates)))
-
-(defun zhihu--cookie-path-matches-p (cookie-path request-path)
-  "返回 COOKIE-PATH 是否适用于 REQUEST-PATH。"
-  (let ((cookie-path (if (string-empty-p cookie-path) "/" cookie-path)))
-    (or (string-equal cookie-path request-path)
-        (and (string-prefix-p cookie-path request-path)
-             (or (string-suffix-p "/" cookie-path)
-                 (and (> (length request-path) (length cookie-path))
-                      (eq (aref request-path (length cookie-path)) ?/)))))))
-
-(defun zhihu--cookie-records-to-alist (records)
-  "按 RFC 6265 发送顺序把 RECORDS 转成 ((NAME . VALUE) ...)。"
-  (mapcar
-   (lambda (record)
-     (cons (zhihu--cookie-record-name record)
-           (zhihu--cookie-record-value record)))
-   (cl-stable-sort
-    (copy-sequence records)
-    (lambda (left right)
-      (let ((left-length
-             (length (zhihu--cookie-record-path left)))
-            (right-length
-             (length (zhihu--cookie-record-path right))))
-        (if (= left-length right-length)
-            (< (or (zhihu--cookie-record-creation left) 0)
-               (or (zhihu--cookie-record-creation right) 0))
-          (> left-length right-length)))))))
-
-(defun zhihu--cookie-records-for-url (records url)
-  "筛选并排序适用于 URL 的 RECORDS，返回 ((NAME . VALUE) ...)。"
-  (pcase-let* ((`(,host ,path ,secure) (zhihu--cookie-url-parts url))
-               (now (float-time))
-               (applicable
-                (cl-remove-if-not
-                 (lambda (record)
-                   (and
-                    (zhihu--cookie-domain-matches-p
-                     (zhihu--cookie-record-domain record) host)
-                    (zhihu--cookie-path-matches-p
-                     (zhihu--cookie-record-path record) path)
-                    (or (not (zhihu--cookie-record-secure record)) secure)
-                    (or (null (zhihu--cookie-record-expires record))
-                        (> (zhihu--cookie-record-expires record) now))))
-                 records)))
-    (zhihu--cookie-records-to-alist applicable)))
-
-;; Firefox cookie database
-
-(defun zhihu--select-firefox-cookies (db table url)
-  "从 DB 的可信 TABLE 中选出适用于 URL 的默认容器 Cookie。"
-  (pcase-let* ((`(,host ,_path ,_secure)
-                 (zhihu--cookie-url-parts url))
-               (domains (zhihu--cookie-domain-candidates host))
-               (placeholders
-                (mapconcat (lambda (_domain) "?") domains ","))
-               (records
-                (mapcar
-                 (lambda (row)
-                   (let ((expiry (nth 4 row)))
-                     (zhihu--make-cookie-record
-                      :name (nth 0 row)
-                      :value (nth 1 row)
-                      :domain (nth 2 row)
-                      :path (or (nth 3 row) "/")
-                      ;; Firefox profiles in the wild use both seconds and
-                      ;; milliseconds for `expiry'.
-                      :expires (and (numberp expiry)
-                                    (if (> expiry 100000000000)
-                                        (/ expiry 1000.0)
-                                      expiry))
-                      :secure (not (zerop (or (nth 5 row) 0)))
-                      :creation (nth 6 row))))
-                 (sqlite-select
-                  db
-                  (concat
-                   "SELECT name, value, host, path, expiry, isSecure, "
-                   "creationTime FROM " table " "
-                   "WHERE host IN (" placeholders
-                   ") AND originAttributes = ?")
-                  (append domains (list ""))))))
-    (zhihu--cookie-records-for-url records url)))
-
-(defun zhihu--sqlite-readonly-uri (path)
-  "把 PATH 转成不会误解析文件名中 URI 保留字符的只读 SQLite URI。"
-  (concat "file:"
-          (url-hexify-string
-           (expand-file-name path)
-           (cons ?/ url-unreserved-chars))
-          "?mode=ro&cache=private"))
-
-(defun zhihu--query-cookie-database (path label query)
-  "查询 Cookie 数据库 PATH，并以 LABEL 生成错误信息。
-QUERY 接收数据库和 schema 名；只读查询发生 SQLite 错误时改读临时
-数据库/WAL 副本。"
-  (let ((run-query
-         (lambda (db schema)
-           (let (transaction)
-             (unwind-protect
-                 (progn
-                   (sqlite-execute db "BEGIN")
-                   (setq transaction t)
-                   (prog1 (funcall query db schema)
-                     (sqlite-execute db "COMMIT")
-                     (setq transaction nil)))
-               (when transaction
-                 (ignore-errors (sqlite-execute db "ROLLBACK"))))))))
-    (condition-case readonly-error
-        (let (db)
-          (unwind-protect
-              (progn
-                ;; `sqlite-open' 没有 readonly 参数，因此只创建内存主库，
-                ;; 再以只读 URI ATTACH 浏览器数据库。
-                (setq db (sqlite-open))
-                (sqlite-execute
-                 db "ATTACH DATABASE ? AS cookies"
-                 (list (zhihu--sqlite-readonly-uri path)))
-                (funcall run-query db "cookies"))
-            (when db
-              (ignore-errors (sqlite-close db)))))
-      (sqlite-error
-       (condition-case copy-error
-           (let (snapshot-directory db)
-             (unwind-protect
-                 (let ((snapshot-name (file-name-nondirectory path)))
-                   (setq snapshot-directory
-                         (make-temp-file "zhihu-cookie-snapshot-" t))
-                   (dolist (suffix '("" "-wal"))
-                     (let ((source (concat path suffix)))
-                       (when (file-readable-p source)
-                         (copy-file
-                          source
-                          (expand-file-name
-                           (concat snapshot-name suffix)
-                           snapshot-directory)
-                          t))))
-                   (setq db
-                         (sqlite-open
-                          (expand-file-name
-                           snapshot-name snapshot-directory)))
-                   (funcall run-query db "main"))
-               (when db
-                 (ignore-errors (sqlite-close db)))
-               (when snapshot-directory
-                 (ignore-errors
-                   (delete-directory snapshot-directory t)))))
-         (error
-          (error "zhihu: 读 %s 失败：只读访问：%s；临时副本：%s"
-                 label
-                 (error-message-string readonly-error)
-                 (error-message-string copy-error))))))))
-
-(defun zhihu--read-firefox-cookies (path url)
-  "从 Firefox cookies.sqlite 的 PATH 读出适用于 URL 的 Cookie。
-返回 ((NAME . VALUE) ...) alist。只读访问失败时改读临时 DB/WAL 副本。"
-  (unless (file-readable-p path)
-    (error "zhihu: Firefox Cookie 数据库不可读：%s" path))
-  (zhihu--cookie-url-parts url)
-  (zhihu--query-cookie-database
-   path "Firefox cookies"
-   (lambda (db schema)
-     (zhihu--select-firefox-cookies
-      db (concat schema ".moz_cookies") url))))
-
-(defun zhihu--chromium-browser-spec (browser)
-  "返回 BROWSER 的 Chromium 凭据存储配置。"
-  (or (cdr (assq browser zhihu--chromium-browser-specs))
-      (error "zhihu: 不支持的 Chromium 系浏览器：%s"
-             browser)))
-
-(defun zhihu--hmac-sha1-bytes (key bytes)
-  "返回 KEY 对 BYTES 的 HMAC-SHA1 原始字节。"
-  (require 'gnutls)
-  (unless (and (fboundp 'gnutls-hash-mac)
-               (assq 'SHA1 (gnutls-macs)))
-    (error "zhihu: 当前 Emacs/GnuTLS 不支持 HMAC-SHA1"))
-  ;; GnuTLS 会主动清空字符串形式的 key，传副本避免破坏调用方缓存。
-  (gnutls-hash-mac 'SHA1 (copy-sequence key) bytes))
-
-(defun zhihu--xor-byte-strings (left right)
-  "逐字节异或等长的 LEFT 与 RIGHT。"
-  (unless (= (length left) (length right))
-    (error "zhihu: 内部 PBKDF2 字节长度不一致"))
-  (let ((output (copy-sequence left)))
-    (dotimes (index (length output))
-      (aset output index
-            (logxor (aref output index) (aref right index))))
-    output))
-
-(defun zhihu--pbkdf2-hmac-sha1 (password salt iterations length)
-  "以 PASSWORD、SALT 和 ITERATIONS 派生 LENGTH 字节 PBKDF2 key。"
-  (unless (and (integerp iterations) (> iterations 0)
-               (integerp length) (> length 0))
-    (error "zhihu: 无效的 PBKDF2 参数"))
-  (let ((block 1)
-        (output (unibyte-string)))
-    (while (< (length output) length)
-      (let* ((counter
-              (unibyte-string
-               (logand (ash block -24) #xff)
-               (logand (ash block -16) #xff)
-               (logand (ash block -8) #xff)
-               (logand block #xff)))
-             (unit
-              (zhihu--hmac-sha1-bytes
-               password (concat salt counter)))
-             (accumulator (copy-sequence unit)))
-        (dotimes (_ (1- iterations))
-          (setq unit (zhihu--hmac-sha1-bytes password unit)
-                accumulator
-                (zhihu--xor-byte-strings accumulator unit)))
-        (setq output (concat output accumulator)
-              block (1+ block))))
-    (substring output 0 length)))
-
-(defun zhihu--chromium-secret-service-password (spec)
-  "按照 SPEC 从 Secret Service 读取 Chromium Safe Storage secret。"
-  (require 'secrets)
-  (unless (and (boundp 'secrets-enabled)
-               (symbol-value 'secrets-enabled))
-    (error "zhihu: 当前会话没有可用的 Secret Service"))
-  (let ((collections
-         (delete-dups
-          (cons "default" (secrets-list-collections))))
-        secret)
-    (condition-case err
-        (dolist (application (plist-get spec :secret-applications))
-          (dolist (collection collections)
-            (unless secret
-              (dolist
-                  (item
-                   (secrets-search-item-paths
-                    collection
-                    :xdg:schema
-                    "chrome_libsecret_os_crypt_password_v2"
-                    :application application))
-                (unless secret
-                  (setq secret
-                        (secrets-get-secret collection item)))))))
-      (error
-       (error "zhihu: 从 Secret Service 读取浏览器密钥失败：%s"
-              (error-message-string err))))
-    (unless (and (stringp secret) (not (string-empty-p secret)))
-      (error "zhihu: Secret Service 中没有浏览器 Safe Storage 密钥"))
-    (encode-coding-string secret 'utf-8 t)))
-
-(defconst zhihu--chromium-kwallet-endpoints
-  '(("org.kde.kwalletd6" "/modules/kwalletd6")
-    ("org.kde.kwalletd5" "/modules/kwalletd5")
-    ("org.kde.kwalletd" "/modules/kwalletd"))
-  "当前 KDE KWallet D-Bus 服务及其对象路径。")
-
-(defun zhihu--chromium-kwallet-password-at (endpoint spec)
-  "从 KWallet ENDPOINT 读取 SPEC 对应的 Safe Storage password。"
-  (require 'dbus)
-  (let* ((service (car endpoint))
-         (path (cadr endpoint))
-         (interface "org.kde.KWallet")
-         (application "zhihu.el")
-         handle)
-    (unwind-protect
-        (progn
-          (unless
-              (dbus-call-method
-               :session service path interface "isEnabled")
-            (error "KWallet 未启用"))
-          (let ((wallet
-                 (dbus-call-method
-                  :session service path interface "networkWallet")))
-            (setq handle
-                  (dbus-call-method
-                   :session service path interface "open"
-                   wallet :int64 0 application)))
-          (unless (and (integerp handle) (>= handle 0))
-            (error "KWallet 无法打开"))
-          (unless
-              (dbus-call-method
-               :session service path interface "hasFolder"
-               :int32 handle
-               (plist-get spec :kwallet-folder)
-               application)
-            (error "KWallet 中没有浏览器密钥目录"))
-          (unless
-              (dbus-call-method
-               :session service path interface "hasEntry"
-               :int32 handle
-               (plist-get spec :kwallet-folder)
-               (plist-get spec :kwallet-key)
-               application)
-            (error "KWallet 中没有浏览器 Safe Storage 密钥"))
-          (let ((password
-                 (dbus-call-method
-                  :session service path interface "readPassword"
-                  :int32 handle
-                  (plist-get spec :kwallet-folder)
-                  (plist-get spec :kwallet-key)
-                  application)))
-            (unless
-                (and (stringp password)
-                     (not (string-empty-p password)))
-              (error "KWallet 中的浏览器密钥为空"))
-            (encode-coding-string password 'utf-8 t)))
-      (when (and (integerp handle) (>= handle 0))
-        (ignore-errors
-          (dbus-call-method
-           :session service path interface "close"
-           :int32 handle nil application))))))
-
-(defun zhihu--chromium-kwallet-password (spec)
-  "从当前 KDE KWallet 读取 SPEC 对应的 Safe Storage password。"
-  (let (password last-error)
-    (dolist (endpoint zhihu--chromium-kwallet-endpoints)
-      (unless password
-        (condition-case err
-            (setq password
-                  (zhihu--chromium-kwallet-password-at endpoint spec))
-          (error (setq last-error err)))))
-    (or password
-        (error "zhihu: 从 KWallet 读取浏览器密钥失败：%s"
-               (if last-error
-                   (error-message-string last-error)
-                 "没有可用服务")))))
-
-(defun zhihu--chromium-linux-password (spec)
-  "从 Linux 桌面凭据存储读取 SPEC 的 Safe Storage password。"
-  (condition-case secret-service-error
-      (zhihu--chromium-secret-service-password spec)
-    (error
-     (condition-case kwallet-error
-         (zhihu--chromium-kwallet-password spec)
-       (error
-        (error
-         "zhihu: 无法读取浏览器 Safe Storage 密钥：Secret Service：%s；KWallet：%s"
-         (error-message-string secret-service-error)
-         (error-message-string kwallet-error)))))))
-
-(defun zhihu--chromium-v10-key ()
-  "返回 GNU/Linux Chromium v10 key。"
-  (unless (eq system-type 'gnu/linux)
-    (error "zhihu: 当前系统不支持 Chromium Cookie 解密"))
-  (copy-sequence zhihu--chromium-linux-v10-key))
-
-(defun zhihu--chromium-v11-key (spec)
-  "按照当前系统与 SPEC 返回 Chromium v11 key。"
-  (unless (eq system-type 'gnu/linux)
-    (error "zhihu: 当前系统不支持 Chromium v11 Cookie"))
-  (let ((password (zhihu--chromium-linux-password spec)))
-    (unwind-protect
-        (zhihu--pbkdf2-hmac-sha1
-         password (encode-coding-string "saltysalt" 'us-ascii t) 1 16)
-      (clear-string password))))
-
-(defun zhihu--pkcs7-unpad (bytes block-size)
-  "校验并移除 BYTES 的 PKCS#7 padding，块大小为 BLOCK-SIZE。"
-  (let* ((length (length bytes))
-         (padding (and (> length 0) (aref bytes (1- length)))))
-    (unless (and (integerp padding)
-                 (> padding 0)
-                 (<= padding block-size)
-                 (<= padding length)
-                 (cl-loop for index from (- length padding) below length
-                          always (= (aref bytes index) padding)))
-      (error "zhihu: Chromium Cookie 的 AES padding 无效"))
-    (substring bytes 0 (- length padding))))
-
-(defun zhihu--chromium-aes-cbc-decrypt (key ciphertext)
-  "以 KEY 解密 Chromium AES-CBC CIPHERTEXT。"
-  (require 'gnutls)
-  (unless (and (fboundp 'gnutls-symmetric-decrypt)
-               (assq 'AES-128-CBC (gnutls-ciphers)))
-    (error "zhihu: 当前 Emacs/GnuTLS 不支持 AES-128-CBC"))
-  (let ((result
-         (gnutls-symmetric-decrypt
-          'AES-128-CBC
-          (copy-sequence key)
-          zhihu--chromium-aes-cbc-iv
-          ciphertext)))
-    (unless (and (consp result) (stringp (car result)))
-      (error "zhihu: Chromium Cookie AES 解密失败"))
-    (zhihu--pkcs7-unpad (car result) 16)))
-
-(defun zhihu--chromium-decrypt-cookie
-    (encrypted-value host-key database-version keys)
-  "用 KEYS 中相应前缀的密钥解密 ENCRYPTED-VALUE。
-同时校验 HOST-KEY domain binding。"
-  (unless (and (stringp encrypted-value)
-               (>= (length encrypted-value) 3))
-    (error "zhihu: Chromium Cookie 密文无效"))
-  (let* ((prefix (substring encrypted-value 0 3))
-         (key-entry (assoc-string prefix keys)))
-    (unless key-entry
-      (error "zhihu: 不支持 Chromium Cookie 加密格式 %s" prefix))
-    (condition-case err
-        (let ((plaintext
-               (zhihu--chromium-aes-cbc-decrypt
-                (cdr key-entry) (substring encrypted-value 3))))
-          (when (>= database-version 24)
-            (let ((domain-hash
-                   (secure-hash
-                    'sha256
-                    (encode-coding-string host-key 'utf-8 t)
-                    nil nil t)))
-              (unless
-                  (and
-                   (>= (length plaintext) (length domain-hash))
-                   (string-prefix-p domain-hash plaintext))
-                (error
-                 "zhihu: Chromium Cookie 的 domain binding 校验失败"))
-              (setq plaintext
-                    (substring plaintext (length domain-hash)))))
-          (decode-coding-string plaintext 'utf-8 t))
-      (error
-       (error "zhihu: Chromium Cookie 解密失败：%s"
-              (error-message-string err))))))
-
-(defun zhihu--chromium-time-to-unix (value)
-  "把 Chromium 微秒时间 VALUE 转成 Unix 秒。"
-  (/ (- value zhihu--chromium-time-epoch-offset) 1000000.0))
-
-(defun zhihu--select-chromium-cookies (db table url spec)
-  "从 DB 的可信 TABLE 读取并解密适用于 URL 的 Chromium Cookie。"
-  (pcase-let* ((`(,host ,request-path ,request-secure)
-                 (zhihu--cookie-url-parts url))
-               (domains (zhihu--cookie-domain-candidates host))
-               (placeholders
-                (mapconcat (lambda (_domain) "?") domains ","))
-               (version-row
-                (car
-                 (sqlite-select
-                  db
-                  (concat
-                   "SELECT value FROM " table ".meta "
-                   "WHERE key = ?")
-                  (list "version"))))
-               (database-version
-                (and version-row
-                     (string-to-number (format "%s" (car version-row)))))
-               (now (float-time))
-               (raw-rows
-                (sqlite-select
-                 db
-                 (concat
-                  "SELECT host_key, name, value, encrypted_value, path, "
-                  "expires_utc, is_secure, has_expires, creation_utc "
-                  "FROM " table ".cookies "
-                  "WHERE top_frame_site_key = ? AND host_key IN ("
-                  placeholders ")")
-                 (cons "" domains)))
-               ;; Apply browser policy before touching encrypted values.
-               ;; An expired or wrong-path record with a newer prefix must
-               ;; not abort an otherwise valid request.
-               (rows
-                (cl-remove-if-not
-                 (lambda (row)
-                   (let* ((host-key (nth 0 row))
-                          (cookie-path (or (nth 4 row) "/"))
-                          (expires-utc (nth 5 row))
-                          (cookie-secure
-                           (not (zerop (or (nth 6 row) 0))))
-                          (has-expires
-                           (not (zerop (or (nth 7 row) 0))))
-                          (expires
-                           (and has-expires
-                                (numberp expires-utc)
-                                (zhihu--chromium-time-to-unix
-                                 expires-utc))))
-                     (and
-                      (zhihu--cookie-domain-matches-p host-key host)
-                      (zhihu--cookie-path-matches-p
-                       cookie-path request-path)
-                      (or (not cookie-secure) request-secure)
-                      (or (not has-expires)
-                          (and expires (> expires now))))))
-                 raw-rows)))
-    (unless (and (integerp database-version) (> database-version 0))
-      (error "zhihu: Chromium Cookie 数据库缺少有效 schema version"))
-    (let ((prefixes
-           (delete-dups
-            (delq nil
-                  (mapcar
-                   (lambda (row)
-                     (let ((plain (nth 2 row))
-                           (encrypted (nth 3 row)))
-                       (and (string-empty-p (or plain ""))
-                            (stringp encrypted)
-                            (>= (length encrypted) 3)
-                            (substring encrypted 0 3))))
-                   rows))))
-          keys records)
-      (unwind-protect
-          (progn
-            (dolist (prefix prefixes)
-              (push
-               (cons
-                prefix
-                (pcase prefix
-                  ("v10" (zhihu--chromium-v10-key))
-                  ("v11" (zhihu--chromium-v11-key spec))
-                  (_
-                   (error
-                    "zhihu: 不支持 Chromium Cookie 加密格式 %s"
-                    prefix))))
-               keys))
-            (dolist (row rows)
-              (let* ((host-key (nth 0 row))
-                     (name (nth 1 row))
-                     (plain-value (nth 2 row))
-                     (encrypted-value (nth 3 row))
-                     (expires (nth 5 row))
-                     (has-expires (not (zerop (or (nth 7 row) 0))))
-                     value)
-                (setq value
-                      (cond
-                       ((not (string-empty-p (or plain-value "")))
-                        plain-value)
-                       ((not (string-empty-p (or encrypted-value "")))
-                        (zhihu--chromium-decrypt-cookie
-                         encrypted-value host-key database-version keys))
-                       (t "")))
-                (push
-                 (zhihu--make-cookie-record
-                  :name name
-                  :value value
-                  :domain host-key
-                  :path (or (nth 4 row) "/")
-                  :expires
-                  (and has-expires (numberp expires)
-                       (zhihu--chromium-time-to-unix expires))
-                  :secure (not (zerop (or (nth 6 row) 0)))
-                  :creation (nth 8 row))
-                 records)))
-            (zhihu--cookie-records-to-alist records))
-        (dolist (entry keys)
-          (when (stringp (cdr entry))
-            (clear-string (cdr entry))))))))
-
-(defun zhihu--read-chromium-cookies (path url browser)
-  "从 BROWSER 的 Chromium Cookie 数据库 PATH 读取 URL 的 Cookie。"
-  (let ((spec (zhihu--chromium-browser-spec browser)))
-    (unless (file-readable-p path)
-      (error "zhihu: %s Cookie 数据库不可读：%s" browser path))
-    (zhihu--query-cookie-database
-     path (format "%s Cookie" browser)
-     (lambda (db schema)
-       (zhihu--select-chromium-cookies db schema url spec)))))
-
 (defun zhihu--read-browser-cookies (url)
   "从显式配置的浏览器 profile 读取适用于完整 URL 的 Cookie。"
-  (let* ((browser zhihu-cookie-browser)
-         (path (zhihu--cookie-store-file browser)))
-    (pcase browser
-      ('firefox
-       (zhihu--read-firefox-cookies path url))
-      ((or 'chromium 'chrome 'edge)
-       (zhihu--read-chromium-cookies path url browser)))))
+  (browser-cookies-get
+   url
+   :browser zhihu-cookie-browser
+   :profile-directory zhihu-cookie-profile-directory))
 
 (defun zhihu--format-cookie-header (cookies xsrf-token)
   "把 COOKIES 与 XSRF-TOKEN 合并成 Cookie header。
@@ -4397,6 +3746,14 @@ PRESENT-FIELDS 必须是 dictionary 中已识别出的直接字段。若字段�
     (if (string-equal base-mime "image/svg+xml")
         (cons "image/png" (zhihu--render-svg-png (cdr image)))
       image)))
+
+(defun zhihu--hmac-sha1-bytes (key bytes)
+  "返回 KEY 对 BYTES 的 HMAC-SHA1 原始字节。"
+  (require 'gnutls)
+  (unless (and (fboundp 'gnutls-hash-mac)
+               (assq 'SHA1 (gnutls-macs)))
+    (error "zhihu: 当前 Emacs/GnuTLS 不支持 HMAC-SHA1"))
+  (gnutls-hash-mac 'SHA1 (copy-sequence key) bytes))
 
 (defun zhihu--hmac-sha1-base64 (key data)
   "HMAC-SHA1(KEY, DATA)，返回 base64 字符串（无换行）。

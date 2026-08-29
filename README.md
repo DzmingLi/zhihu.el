@@ -9,6 +9,7 @@
 ## 依赖
 
 - Emacs 31.1，并启用 SQLite、libxml 和 GnuTLS 支持
+- [`browser-cookies.el`](https://github.com/DzmingLi/browser-cookies.el) 0.1.0 或更高版本，用于读取浏览器登录态
 - [`plz.el`](https://github.com/alphapapa/plz.el) master（`0.10-pre`；）
 - [`pandoc`](https://pandoc.org/) 3.1.10 或更高版本，用于规范化 Typst HTML；Org 正文使用 Emacs 内置的 `ox-html`
 - 可选：使用 Typst 源文件，或转换本地路径 / `data:` URL 中的 SVG 时，
@@ -22,7 +23,8 @@
 
 请先在受支持的浏览器中登录知乎。本包支持 Firefox、Chromium、Google
 Chrome 和 Microsoft Edge；默认读取 Firefox。浏览器及其实际
-profile 根目录都需要显式设置给`zhihu-cookie-profile-directory`。本包不会扫描或猜。
+profile 根目录都需要显式设置给 `zhihu-cookie-profile-directory`。底层读取由
+`browser-cookies.el` 提供，不会扫描或猜测 profile。
 
 | 浏览器 | `zhihu-cookie-profile-directory` 的语义 | 固定读取的相对路径 |
 | --- | --- | --- |
