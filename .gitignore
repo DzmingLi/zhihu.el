@@ -4,3 +4,6 @@
 .\#*
 /.dir-locals-2.el
 /.project
+
+/PUBLISHING.md
+/test/

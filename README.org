@@ -1,0 +1,264 @@
+#+TITLE: Zhihu On Emacs
+#+OPTIONS: toc:2
+
+在 Emacs 中使用 Org 撰写、存档并发布知乎回答和文章，并可以指定文章专栏。
+Org 到知乎方言 HTML 的纯导出由同仓库的 =ox-zhihu.el= 提供；本包在导出结果
+之上完成登录、图片上传与发布。
+
+#+begin_quote
+*WARNING*：本项目使用知乎非公开的网页接口，知乎可能随时改变接口行为。同时
+此项目处于开发早期，由于作者仅使用 Firefox，在别的浏览器上的 cookie 读取
+未经过测试。
+#+end_quote
+
+* 依赖
+
+- Emacs 31.1，并启用 SQLite、libxml 和 GnuTLS 支持
+- [[https://github.com/DzmingLi/browser-cookies.el][browser-cookies.el]] 0.1.0 或更高版本，用于读取浏览器登录态
+- [[https://github.com/alphapapa/plz.el][plz.el]] master（=0.10-pre=）
+- [[https://github.com/DzmingLi/org-typst-math][org-typst-math]] 0.1.0 或更高版本。包本身在加载时依赖它；只有在源稿声明
+  =#+TYPST_MATH: t= 时才会调用其 Rust helper 把 Typst 数学转成 TeX
+- 可选：转换本地路径 / =data:= URL 中的 SVG 时需要 PATH 中的
+  [[https://typst.app/][typst]] 0.15.0 或更高版本
+- 可选：如果源稿使用 Mermaid 图，
+  [[https://github.com/mermaid-js/mermaid-cli][@mermaid-js/mermaid-cli]] 提供的 =mmdc=
+
+* 配置
+
+请先在受支持的浏览器中登录知乎。本包支持 Firefox、Chromium、Google
+Chrome 和 Microsoft Edge；默认读取 Firefox。浏览器及其实际 profile 根目录
+都需要显式设置给 =zhihu-cookie-profile-directory=。底层读取由
+=browser-cookies.el= 提供，不会扫描或猜测 profile。
+
+| 浏览器                     | =zhihu-cookie-profile-directory= 的语义 | 固定读取的相对路径 |
+|----------------------------+-----------------------------------------+--------------------|
+| Firefox                    | 例如 =xxxxxxxx.default-release/=        | =cookies.sqlite=   |
+| Chromium / Chrome / Edge   | 例如 =Default/= 或 =Profile 1/=         | =Network/Cookies=  |
+
+本包仅支持 GNU/Linux，浏览器版本只支持各项目的最新稳定版。
+
+回答/文章没有单独指定转载权限时，使用
+=zhihu-publish-default-reprint-permission=（默认 =allowed=）；回答或文章
+没有单独指定评论权限时，使用
+=zhihu-publish-default-comment-permission=（默认 =all=）。
+
+如需在文章末尾自动追加 Creative Commons 许可引用，可通过
+=zhihu-article-cc-statement= 自定义，这一选项将会适用于所有文章。
+
+* 导出
+
+=ox-zhihu.el= 定义了一个从 =html= 派生的 Org 导出后端 =zhihu=，它把 Org
+正文转换成知乎方言 HTML。这一层是纯导出：不读 cookie、不访问网络、不上传
+图片，可以单独使用：
+
+- 导出菜单 =C-c C-e z= 下的 “To Zhihu”；
+- =M-x org-zhihu-export-as-html=：导出到 =*Org Zhihu Export*= buffer；
+- =M-x org-zhihu-export-to-html=：导出到同目录的 =.html= 文件。
+
+=zhihu-publish= 内部复用同一个后端，再在上传阶段替换图片地址并调用知乎
+接口。
+
+* 工作流
+
+提供问题 ID 或者 URL，写新回答：
+
+#+begin_example
+M-x zhihu-new-answer
+#+end_example
+
+命令创建并打开 =.org= 回答源稿后会显式启用 =zhihu-mode=。
+
+申请创建新的普通知乎专栏：
+
+#+begin_example
+M-x zhihu-new-column
+#+end_example
+
+专栏名称必填且最多 20 个字符，简介可空且最多 1000 个字符。封面是可选的，
+本命令不会提示或上传封面。
+
+写新文章无需专用的新建命令：创建 =.org= 源稿即可。保留空 =article-id= 时
+作为新文章；文章需要文档标题。需要指定专栏、话题或其它发布设置时，再添加
+相应 metadata。
+
+更新已有知乎文章或回答，或者把已有文件首次发布到知乎：
+
+#+begin_example
+M-x zhihu-publish
+#+end_example
+
+发布过程中，本包会把服务端返回的知乎回答或文章 ID 写回源文件；其中空
+=article-id= 表示首次发布，非空值表示更新已有文章。
+
+=zhihu-mode= 是不占用键位的编辑辅助 minor mode。本包不会扫描或自动识别
+Org 文件；需要编辑辅助时手动运行 =M-x zhihu-mode=。在 =column-id= 值槽运行
+=M-x completion-at-point=，候选会显示当前账号可投稿的专栏名称和 ID，
+选择后只把实际 ID 写入源稿；=topics= 的字符串元素也支持同样的就地补全。
+
+* 语法
+
+在文章和回答中，数学公式、表格、加粗、斜体、标题层级、超链接、代码块和
+脚注均受支持，采用 Org 自带的语法。
+
+** 数学
+
+默认情况 =$...$=、=\(...\)=、=$$...$$= 和 =\[...\]= 中的内容是 LaTeX，
+沿用 =ox-html= 的处理，发布时转换为知乎 equation。
+
+若在源稿中声明 =#+TYPST_MATH: t=，这些容器内的数学改由
+[[https://github.com/DzmingLi/org-typst-math][org-typst-math]] 解析为 Typst
+数学，并由其 helper 转换成 TeX 后走同一条 equation 路径：
+
+#+begin_example
+#+TYPST_MATH: t
+#+TYPST_HEADER: #let vect(x) = math.bold(x)
+
+行内 $vect(v)$，或者 \(frac(a, b)\)。
+
+\[
+  sum_(k=1)^n k = (n(n+1))/2
+\]
+#+end_example
+
+=TYPST_HEADER= 可以出现多次，按顺序拼接，用于定义数学宏；其中的本地
+=#import= 以源稿所在目录为基解析。未声明 =TYPST_MATH= 时完全保留 Org 原生
+的 LaTeX 行为。
+
+** 文章内章节链接
+
+文章可以用 Org 原生的 fragment 链接跳到同一篇文章的标题。必须同时设置
+=#+TOC: headlines N=，目标在最终 HTML 中必须是 =h2= 或 =h3=：
+
+#+begin_example
+[[#conclusion][跳到结论]]
+
+* 结论
+:PROPERTIES:
+:CUSTOM_ID: conclusion
+:END:
+#+end_example
+
+** 链接卡片
+
+卡片直接使用 Microformats2 的 [[https://microformats.org/wiki/h-cite][h-cite]]
+HTML，必须独占一个段落。一个卡片必须恰好包含一个 =u-url= 和一个非空
+=p-name=；=u-url= 必须是带 host 的 HTTP(S) 链接：
+
+#+begin_example
+#+begin_export html
+<div class="h-cite">
+  <a class="u-url p-name" href="https://github.com/">GitHub</a>
+</div>
+#+end_export
+#+end_example
+
+博客也可直接用 =.h-cite=、=.u-url= 和 =.p-name= 编写 CSS。=p-author=、
+=p-publication=、=dt-published= 等标准 h-cite 属性可以留给博客使用，发布
+知乎时只读取 URL 和标题。
+
+** @ 知乎用户
+
+运行 =M-x zhihu-insert-user-mention=，搜索并选择用户。命令会插入持久化的
+链接标记，发布时转换为知乎原生 =member_mention= 链接。普通用户主页链接
+不会自动升级为 mention。
+
+** 话题
+
+在 =#+ZHIHU_TOPICS:= 的某个 JSON 字符串元素内输入关键词，然后运行：
+
+#+begin_example
+M-x completion-at-point
+#+end_example
+
+#+begin_example
+#+ZHIHU_TOPICS: ["Emacs", "Org"]
+#+end_example
+
+补全会按当前元素的文字调用知乎话题搜索，保留远端相关性顺序，并在候选中
+显示简介和话题 ID；提交后源稿只保留规范的话题名称。把光标放在引号内即可
+补全，空查询不会请求网络。这是按关键词的话题自动补全；知乎网页编辑器根据
+已上传正文生成的“推荐话题”不是本地补全的一部分。
+
+发布文章时，本地列表是完整事实来源：远端缺少的话题会绑定，多出的话题会
+解绑；源稿没有 =topics= 时表示空集合，会清除远端全部话题。回答不支持
+=topics=。源稿只保存话题名称；发布时再从知乎的名称完全匹配候选取得对应
+ID。
+
+** 脚注（知乎引用）
+
+知乎引用只能保存一段纯文本和一个可选 URL。因此脚注目前必须是单段，最多
+包含一个带 host 的 HTTP(S) 链接；强调、粗体、删除线和行内代码会转成纯
+文本。多段、多链接、列表、代码块、图片、公式或 raw 内容会在发布前报错，
+避免静默丢失信息；嵌套脚注不在支持范围内。纯文字脚注会生成空的引用 URL。
+
+** 分割线
+
+Org 原生的水平分隔线会转换为知乎可接受的分割线：
+
+#+begin_example
+-----
+#+end_example
+
+* 元数据示例
+
+回答：
+
+#+begin_example
+#+TITLE: 示例回答
+#+ZHIHU_QUESTION_ID: 123456
+#+end_example
+
+新文章：
+
+#+begin_example
+#+TITLE: 示例文章
+#+BANNER: ./images/banner.jpg
+#+TOC: headlines 2
+#+ZHIHU_ARTICLE_ID:
+#+ZHIHU_TOPICS: ["Emacs", "org-mode"]
+#+end_example
+
+每篇源稿必须且只能包含 =question-id= 或 =article-id= 之一，分别表示回答
+或文章。类型按字段是否存在判定，而不是按 ID 是否非空判定；即使 ID 槽仍为
+空也算存在。
+
+=article-id= 是唯一的空值例外：首次发布前保留空槽，发布成功后自动在原位
+写入服务端 ID。尚未取得的 =answer-id= 仍应整个省略。
+
+需要加入专栏时，在含 =article-id= 的文章 metadata 下额外填写 =column-id=；
+=column-id= 不能单独标记文章。发布文章后会检查当前专栏，尚未收录时才发起
+收录。启用 =zhihu-mode= 后，可在该字段值槽调用 =completion-at-point=，
+按专栏名称选择并写入 ID；候选列表在当前 buffer 中懒加载并缓存，revert 后
+重新读取。
+
+=banner= 与 =title= 一样属于通用文档 metadata，使用 =#+BANNER:=，不写进
+知乎渠道字段。值是非空的本地图片路径，相对路径以源稿所在目录为基。知乎
+文章发布会把它用作题图，字段缺失会清除知乎上的现有封面；回答发布不会读取
+或使用它。
+
+目录请求也属于通用文档结构。使用 =#+TOC: headlines 1..3=，只有文章发布会
+读取它，并把它映射为知乎原生文章目录；回答会忽略它。没有目录请求时，文章
+目录关闭。
+
+以下知乎设置都属于单篇稿件，使用 =#+ZHIHU_*= 关键字：
+
+| 设置     | 关键字                          | 可用值                                                                              | 未填写时             |
+|----------+---------------------------------+-------------------------------------------------------------------------------------+----------------------|
+| 创作声明 | =#+ZHIHU_CREATION_STATEMENT:=   | =spoiler=、=medical_advice=、=fictional_creation=、=contain_finance=、=ai_creation= | 无创作声明           |
+| 内容来源 | =#+ZHIHU_CONTENT_SOURCE:=       | =officialWebsite=、=newsReport=、=TVMedia=、=printMedia=                            | 不标注来源           |
+| 话题     | =#+ZHIHU_TOPICS:=               | 文章至多三个；回答不支持                                                            | 文章会清空远端话题   |
+| 转载权限 | =#+ZHIHU_REPRINT_PERMISSION:=   | =allowed=、=disallowed=、=need_payment=                                             | 使用转载权限默认值   |
+| 评论权限 | =#+ZHIHU_COMMENT_PERMISSION:=   | =all=、=censor=、=followee=、=nobody=                                               | 使用评论权限默认值   |
+
+=content-source= 对应“内容信息来源”渠道；知乎同一面板中的自行拍摄时间和
+地点不是这个标量字段的一部分，目前不写入。
+
+上表中的可选发布设置缺失时使用对应默认值；一旦出现，就必须是非空且类型、
+取值有效的值。
+
+* 致谢
+
+- [[https://github.com/pxwg/zhihu.nvim][zhihu.nvim]]：发布 payload、浏览器
+  Cookie 读取和图片上传协议的主要参考实现。
+- [[https://github.com/zly2006/zhihu-sign-kt][zhihu-sign-kt]]：ZSE v4 签名
+  算法的 MIT 许可实现。
