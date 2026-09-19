@@ -617,75 +617,6 @@ CANONICAL 非 nil 时要求 TEXT 已经是规范形式。"
             ,@(cl-mapcan #'zhihu--org-normalize-node
                          (dom-children body))))))
 
-(defun zhihu--h-cite-node-p (node)
-  "NODE 是否是 Microformats2 `h-cite' 根节点。"
-  (and (consp node) (zhihu--node-has-class-p node "h-cite")))
-
-(defun zhihu--h-cite-property-nodes (node property)
-  "返回 NODE 内具有 Microformats2 PROPERTY class 的元素。"
-  (dom-search
-   node
-   (lambda (child)
-     (and
-      (consp child)
-      (zhihu--node-has-class-p child property)))))
-
-(defun zhihu--single-h-cite-child (node)
-  "返回 NODE 唯一的 `h-cite' 子节点，否则返回 nil。"
-  (pcase (zhihu--dom-significant-children node)
-    (`(,child)
-     (and (zhihu--h-cite-node-p child) child))))
-
-(defun zhihu--validate-h-cite-placement (body)
-  "确保 BODY 中的 `h-cite' 只作为顶层独立内容出现。"
-  (let (allowed)
-    (dolist (child (zhihu--dom-significant-children body))
-      (cond
-       ((zhihu--h-cite-node-p child)
-        (push child allowed))
-       ((and (consp child) (eq (dom-tag child) 'p))
-        (when-let* ((cite (zhihu--single-h-cite-child child)))
-          (push cite allowed)))))
-    (dolist (node (dom-search body #'zhihu--h-cite-node-p))
-      (unless (memq node allowed)
-        (error "zhihu: h-cite 卡片必须是文档顶层的独立内容")))))
-
-(defun zhihu--h-cite-data (node)
-  "严格读取 Microformats2 `h-cite' NODE 的 URL 与标题。"
-  (let ((url-nodes (zhihu--h-cite-property-nodes node "u-url"))
-        (name-nodes (zhihu--h-cite-property-nodes node "p-name")))
-    (unless (= (length url-nodes) 1)
-      (error "zhihu: h-cite 卡片必须只包含一个 u-url"))
-    (unless (= (length name-nodes) 1)
-      (error "zhihu: h-cite 卡片必须只包含一个 p-name"))
-    (let* ((url-node (car url-nodes))
-           (name-node (car name-nodes))
-           (url
-            (and (eq (dom-tag url-node) 'a)
-                 (dom-attr url-node 'href)))
-           (title
-            (string-trim
-             (replace-regexp-in-string
-              "[[:space:]]+" " " (dom-inner-text name-node)))))
-      (unless (zhihu--web-url-p url)
-        (error
-         "zhihu: h-cite 的 u-url 必须是含 host 的 HTTP(S) 链接"))
-      (when (string-empty-p title)
-        (error "zhihu: h-cite 的 p-name 不能为空"))
-      (list :url url :title title))))
-
-(defun zhihu--native-link-card-node (node)
-  "把 Microformats2 `h-cite' NODE 转成知乎原生 link-card。"
-  (let* ((data (zhihu--h-cite-data node))
-         (url (plist-get data :url))
-         (title (plist-get data :title)))
-    `(a ((href . ,url)
-         (data-draft-node . "block")
-         (data-draft-type . "link-card")
-         (data-draft-title . ,title)
-         (data-draft-cover . ""))
-        ,title)))
-
 (defun zhihu--math-span-p (node)
   "NODE 是否是通用 math span。"
   (and (consp node)
@@ -824,13 +755,6 @@ STANDALONE-IMAGE 非 nil 表示 NODE 是独占段落或带图注的普通图片�
       (if (stringp alt) alt "")))
    ((zhihu--reference-marker-p node)
     (zhihu--native-reference-node node))
-   ((zhihu--h-cite-node-p node)
-    (zhihu--native-link-card-node node))
-   ((and
-     (eq (dom-tag node) 'p)
-     (zhihu--single-h-cite-child node))
-    (zhihu--native-link-card-node
-     (zhihu--single-h-cite-child node)))
    ((zhihu--math-span-p node)
     (let* ((display (zhihu--node-has-class-p node "display"))
            (tex (zhihu--math-span-tex node)))
@@ -900,7 +824,6 @@ STANDALONE-IMAGE 非 nil 表示 NODE 是独占段落或带图注的普通图片�
          (body (car (dom-by-tag dom 'body)))
          (new-body `(body nil ,@(mapcar #'zhihu--zhihuify-node
                                         (dom-children body)))))
-    (zhihu--validate-h-cite-placement body)
     (zhihu--inner-html new-body)))
 
 (defun zhihu--png-bytes-p (bytes)
@@ -1027,8 +950,16 @@ STANDALONE-IMAGE 非 nil 表示 NODE 是独占段落或带图注的普通图片�
     (zhihu--org-normalize-structure
      (zhihu--org-rewrite-footnotes body)))))
 
+(defun zhihu--org-export-block (export-block contents info)
+  "导出 EXPORT-BLOCK。
+`zhihu' 块原样保留，其余交给 `org-html-export-block'。"
+  (if (member (org-element-property :type export-block) '("ZHIHU"))
+      (org-remove-indentation (org-element-property :value export-block))
+    (org-html-export-block export-block contents info)))
+
 (org-export-define-derived-backend 'zhihu 'html
   :options-alist '((:typst-header "TYPST_HEADER" nil nil newline))
+  :translate-alist '((export-block . zhihu--org-export-block))
   :filters-alist
   '((:filter-parse-tree . zhihu--org-typst-math-prepare)
     (:filter-latex-fragment . zhihu--org-html-latex-fragment-filter)

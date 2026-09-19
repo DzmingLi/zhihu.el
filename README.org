@@ -140,21 +140,22 @@ Org 文件；需要编辑辅助时手动运行 =M-x zhihu-mode=。在 =column-id
 
 ** 链接卡片
 
-卡片直接使用 Microformats2 的 [[https://microformats.org/wiki/h-cite][h-cite]]
-HTML，必须独占一个段落。一个卡片必须恰好包含一个 =u-url= 和一个非空
-=p-name=；=u-url= 必须是带 host 的 HTTP(S) 链接：
+链接卡片就是知乎自己的 HTML，不属于 Org，也不是通用微格式。把它写进
+=#+begin_export zhihu= 块，并让它独占一个段落：
 
 #+begin_example
-#+begin_export html
-<div class="h-cite">
-  <a class="u-url p-name" href="https://github.com/">GitHub</a>
-</div>
+#+begin_export zhihu
+<a href="https://github.com/"
+   data-draft-node="block"
+   data-draft-type="link-card"
+   data-draft-title="GitHub"
+   data-draft-cover="">GitHub</a>
 #+end_export
 #+end_example
 
-博客也可直接用 =.h-cite=、=.u-url= 和 =.p-name= 编写 CSS。=p-author=、
-=p-publication=、=dt-published= 等标准 h-cite 属性可以留给博客使用，发布
-知乎时只读取 URL 和标题。
+=draft-title= 是卡片标题，=data-draft-cover= 留空让知乎自行抓取封面。
+=#+begin_export zhihu= 只被 =ox-zhihu= 导出，其它导出器会忽略它；如果同时
+希望这段 HTML 出现在别的 HTML 导出里，改用 =#+begin_export html= 即可。
 
 ** @ 知乎用户
 
