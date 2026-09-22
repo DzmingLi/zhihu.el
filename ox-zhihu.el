@@ -5,7 +5,7 @@
 ;; Author: Dzming Li <i@dzming.li>
 ;; Maintainer: Dzming Li <i@dzming.li>
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "31.1") (org-typst-math "0.1.0"))
+;; Package-Requires: ((emacs "31.1"))
 ;; Keywords: outlines, hypermedia
 ;; URL: https://github.com/DzmingLi/zhihu.el
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -35,8 +35,8 @@
 ;;   - `org-zhihu-export-as-html' 与 `org-zhihu-export-to-html'；
 ;;   - `zhihu--org->html'：字符串进、知乎方言 HTML fragment 出。
 ;;
-;; 依赖 `org-typst-math' 处理 `#+TYPST_MATH: t' 文档里的 Typst 数学。知乎的
-;; equation 接口只接受 TeX，因此这里先把 Typst 数学转成 LaTeX。
+;; 可选使用 `org-typst-math' 处理 `#+TYPST_MATH: t' 文档里的 Typst 数学。
+;; 知乎的 equation 接口只接受 TeX，因此这里先把 Typst 数学转成 LaTeX。
 
 ;;; Code:
 
@@ -47,14 +47,15 @@
 (require 'dom)
 (require 'xml)
 (require 'ox-html)
-(require 'org-typst-math)
-(require 'typst-client)
 
 (declare-function org-element-map "org-element" (data types fun &rest args))
 (declare-function org-element-property
                   "org-element" (property node &optional dflt force-undefer))
 (declare-function org-element-put-property
                   "org-element" (node property value))
+(declare-function org-typst-math-fragment "org-typst-math" (element))
+(declare-function typst-client-convert
+                  "typst-client" (directory preamble items target))
 
 
 ;;;; HTML conversion
@@ -899,7 +900,13 @@ STANDALONE-IMAGE 非 nil 表示 NODE 是独占段落或带图注的普通图片�
 
 (defun zhihu--org-typst-math-prepare (tree _backend info)
   "把 TREE 中的 Typst 数学转换为 LaTeX，并改写各 fragment 的 `:value'。"
-  (when (org-typst-math--enabled-p (plist-get info :typst-math))
+  (when (let ((value (plist-get info :typst-math)))
+          (or (eq value t)
+              (and (stringp value)
+                   (string-equal (downcase (string-trim value)) "t"))))
+    (unless (require 'org-typst-math nil t)
+      (user-error
+       "zhihu: 使用 #+TYPST_MATH: t 需要安装 org-typst-math"))
     (let ((preamble (or (plist-get info :typst-header) ""))
           elements fragments items)
       (org-element-map tree 'latex-fragment
@@ -958,7 +965,8 @@ STANDALONE-IMAGE 非 nil 表示 NODE 是独占段落或带图注的普通图片�
     (org-html-export-block export-block contents info)))
 
 (org-export-define-derived-backend 'zhihu 'html
-  :options-alist '((:typst-header "TYPST_HEADER" nil nil newline))
+  :options-alist '((:typst-math "TYPST_MATH" nil nil t)
+                   (:typst-header "TYPST_HEADER" nil nil newline))
   :translate-alist '((export-block . zhihu--org-export-block))
   :filters-alist
   '((:filter-parse-tree . zhihu--org-typst-math-prepare)

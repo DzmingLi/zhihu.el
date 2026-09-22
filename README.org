@@ -15,8 +15,9 @@ Org 到知乎方言 HTML 的纯导出由同仓库的 =ox-zhihu.el= 提供；本�
 - 一个 Cookie 函数：接收完整 URL，返回 =((NAME . VALUE) ...)=；例如
   [[https://github.com/DzmingLi/firefox-cookies.el][firefox-cookies.el]] 提供的 =firefox-cookies-get=
 - [[https://github.com/alphapapa/plz.el][plz.el]] master（=0.10-pre=）
-- [[https://github.com/DzmingLi/org-typst-math][org-typst-math]] 0.1.0 或更高版本。包本身在加载时依赖它；只有在源稿声明
-  =#+TYPST_MATH: t= 时才会调用其 Rust helper 把 Typst 数学转成 TeX
+- 可选：源稿声明 =#+TYPST_MATH: t= 时需要
+  [[https://github.com/DzmingLi/org-typst-math][org-typst-math]] 0.1.0 或更高版本，
+  用它的 Rust helper 把 Typst 数学转成 TeX；普通导出不会加载它
 - 可选：转换本地路径 / =data:= URL 中的 SVG 时需要 PATH 中的
   [[https://typst.app/][typst]] 0.15.0 或更高版本
 - 可选：如果源稿使用 Mermaid 图，
