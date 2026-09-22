@@ -5,7 +5,7 @@
 ;; Author: Dzming Li <i@dzming.li>
 ;; Maintainer: Dzming Li <i@dzming.li>
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "31.1") (browser-cookies "0.1.0") (plz "0.10-pre") (ox-zhihu "0.1.0"))
+;; Package-Requires: ((emacs "31.1") (plz "0.10-pre") (ox-zhihu "0.1.0"))
 ;; Keywords: convenience, hypermedia, tools
 ;; URL: https://github.com/DzmingLi/zhihu.el
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -60,7 +60,6 @@
 ;;; Code:
 
 (require 'cl-lib)
-(require 'browser-cookies)
 (require 'subr-x)
 (require 'url)
 (require 'url-util)
@@ -132,19 +131,11 @@ CC 许可和 CC0 均不可撤销，启用前应确认自己拥有或控制相关
 
 ;;;; Cookies
 
-(defcustom zhihu-cookie-browser 'firefox
-  "提供知乎登录 Cookie 的浏览器。"
-  :type '(choice
-          (const :tag "Firefox" firefox)
-          (const :tag "Chromium" chromium)
-          (const :tag "Google Chrome" chrome)
-          (const :tag "Microsoft Edge" edge))
-  :group 'zhihu)
-
-(defcustom zhihu-cookie-profile-directory nil
-  "用于读取知乎 Cookie 的显式浏览器 profile 目录。"
-  :type '(choice (const :tag "未配置" nil)
-                 (directory :must-match t))
+(defcustom zhihu-cookie-function nil
+  "Function used to obtain cookies for a URL.
+The function receives one absolute HTTP(S) URL and returns an alist of
+(NAME . VALUE) string pairs in transmission order."
+  :type '(choice (const :tag "未配置" nil) function)
   :group 'zhihu)
 
 (cl-defstruct
@@ -165,12 +156,11 @@ CC 许可和 CC0 均不可撤销，启用前应确认自己拥有或控制相关
   seen
   source-function)
 
-(defun zhihu--read-browser-cookies (url)
-  "从显式配置的浏览器 profile 读取适用于完整 URL 的 Cookie。"
-  (browser-cookies-get
-   url
-   :browser zhihu-cookie-browser
-   :profile-directory zhihu-cookie-profile-directory))
+(defun zhihu--read-cookies (url)
+  "通过 `zhihu-cookie-function' 读取适用于完整 URL 的 Cookie。"
+  (unless (functionp zhihu-cookie-function)
+    (user-error "zhihu-cookie-function 尚未配置"))
+  (funcall zhihu-cookie-function url))
 
 (defun zhihu--format-cookie-header (cookies xsrf-token)
   "把 COOKIES 与 XSRF-TOKEN 合并成 Cookie header。
@@ -454,7 +444,7 @@ WITH-ZHIHU-COOKIES 非 nil 时从所选浏览器读取 URL 对应的 Cookie；�
                (url-host (url-generic-parse-url url))))
          (cookies
           (and cookie-host
-               (zhihu--read-browser-cookies url)))
+               (zhihu--read-cookies url)))
          (cookie
           (and cookie-host
                (zhihu--format-cookie-header

@@ -6,15 +6,14 @@ Org 到知乎方言 HTML 的纯导出由同仓库的 =ox-zhihu.el= 提供；本�
 之上完成登录、图片上传与发布。
 
 #+begin_quote
-*WARNING*：本项目使用知乎非公开的网页接口，知乎可能随时改变接口行为。同时
-此项目处于开发早期，由于作者仅使用 Firefox，在别的浏览器上的 cookie 读取
-未经过测试。
+*WARNING*：本项目使用知乎非公开的网页接口，知乎可能随时改变接口行为。
 #+end_quote
 
 * 依赖
 
 - Emacs 31.1，并启用 SQLite、libxml 和 GnuTLS 支持
-- [[https://github.com/DzmingLi/browser-cookies.el][browser-cookies.el]] 0.1.0 或更高版本，用于读取浏览器登录态
+- 一个 Cookie 函数：接收完整 URL，返回 =((NAME . VALUE) ...)=；例如
+  [[https://github.com/DzmingLi/firefox-cookies.el][firefox-cookies.el]] 提供的 =firefox-cookies-get=
 - [[https://github.com/alphapapa/plz.el][plz.el]] master（=0.10-pre=）
 - [[https://github.com/DzmingLi/org-typst-math][org-typst-math]] 0.1.0 或更高版本。包本身在加载时依赖它；只有在源稿声明
   =#+TYPST_MATH: t= 时才会调用其 Rust helper 把 Typst 数学转成 TeX
@@ -25,17 +24,19 @@ Org 到知乎方言 HTML 的纯导出由同仓库的 =ox-zhihu.el= 提供；本�
 
 * 配置
 
-请先在受支持的浏览器中登录知乎。本包支持 Firefox、Chromium、Google
-Chrome 和 Microsoft Edge；默认读取 Firefox。浏览器及其实际 profile 根目录
-都需要显式设置给 =zhihu-cookie-profile-directory=。底层读取由
-=browser-cookies.el= 提供，不会扫描或猜测 profile。
+本包不配置或识别具体浏览器，只调用 =zhihu-cookie-function=。如果使用
+=firefox-cookies.el= 实现，请在 Emacs 配置中加载它、选择 Firefox profile，
+再把函数交给本包：
 
-| 浏览器                     | =zhihu-cookie-profile-directory= 的语义 | 固定读取的相对路径 |
-|----------------------------+-----------------------------------------+--------------------|
-| Firefox                    | 例如 =xxxxxxxx.default-release/=        | =cookies.sqlite=   |
-| Chromium / Chrome / Edge   | 例如 =Default/= 或 =Profile 1/=         | =Network/Cookies=  |
+#+begin_src emacs-lisp
+(require 'firefox-cookies)
+(setq firefox-cookies-profile-directory
+      "~/.mozilla/firefox/xxxxxxxx.default-release/")
+(setq zhihu-cookie-function #'firefox-cookies-get)
+#+end_src
 
-本包仅支持 GNU/Linux，浏览器版本只支持各项目的最新稳定版。
+Firefox profile 不会被自动扫描或猜测；Container 等实现细节由 Cookie 函数
+自身配置，而不是由 =zhihu.el= 配置。
 
 回答/文章没有单独指定转载权限时，使用
 =zhihu-publish-default-reprint-permission=（默认 =allowed=）；回答或文章
