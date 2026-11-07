@@ -13,7 +13,7 @@ Org 到知乎方言 HTML 的纯导出由同仓库的 =ox-zhihu.el= 提供；本�
 
 - Emacs 31.1，并启用 SQLite、libxml 和 GnuTLS 支持
 - 一个 Cookie 函数：接收完整 URL，返回 =((NAME . VALUE) ...)=；例如
-  [[https://github.com/DzmingLi/firefox-cookies.el][firefox-cookies.el]] 提供的 =firefox-cookies-get=
+  [[https://github.com/DzmingLi/camulus][Camulus]] 提供的 =camulus-firefox-cookies-get=
 - [[https://github.com/alphapapa/plz.el][plz.el]] master（=0.10-pre=）
 - 可选：源稿声明 =#+TYPST_MATH: t= 时需要
   [[https://github.com/DzmingLi/org-typst-math][org-typst-math]] 0.1.0 或更高版本，
@@ -26,14 +26,15 @@ Org 到知乎方言 HTML 的纯导出由同仓库的 =ox-zhihu.el= 提供；本�
 * 配置
 
 本包不配置或识别具体浏览器，只调用 =zhihu-cookie-function=。如果使用
-=firefox-cookies.el= 实现，请在 Emacs 配置中加载它、选择 Firefox profile，
+Camulus 实现，请在 Emacs 配置中加载它、选择 Firefox profile，
 再把函数交给本包：
 
 #+begin_src emacs-lisp
-(require 'firefox-cookies)
-(setq firefox-cookies-profile-directory
+(require 'camulus)
+(require 'zhihu)
+(setopt camulus-firefox-profile
       "~/.mozilla/firefox/xxxxxxxx.default-release/")
-(setq zhihu-cookie-function #'firefox-cookies-get)
+(setopt zhihu-cookie-function #'camulus-firefox-cookies-get)
 #+end_src
 
 Firefox profile 不会被自动扫描或猜测；Container 等实现细节由 Cookie 函数
